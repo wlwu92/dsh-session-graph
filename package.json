@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-graph",
-  "version": "0.5.1",
-  "description": "DSH Web plugin: a project session map with mainline dimensions, tags and PR links, plus /summarize-* commands that write DSH_SESSION_GRAPH.md.",
+  "version": "0.6.0",
+  "description": "DSH Web plugin: a project session knowledge graph with mainline dimensions, tags and PR links, plus /summarize-* commands that write DSH_SESSION_GRAPH.md.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/wlwu92/dsh-session-graph.git"
@@ -27,6 +27,7 @@
     "locale/*.json",
     "icon.svg",
     "preview.png",
+    "preview-graph.png",
     "test",
     "README.md",
     "LICENSE"
@@ -36,6 +37,7 @@
     "dsh-plugin",
     "deepseek-harness",
     "session-graph",
+    "knowledge-graph",
     "session-map",
     "sessions",
     "summarize"
@@ -45,7 +47,7 @@
   },
   "scripts": {
     "test": "node test/load.mjs && node test/host.mjs",
-    "screenshots": "node screenshots/build.mjs"
+    "screenshots": "node screenshots/build.mjs && node screenshots/graph.mjs"
   },
   "dsh": {
     "client": {

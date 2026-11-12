@@ -132,8 +132,16 @@ def load_sessions(home: Path) -> dict[str, dict]:
         outline = (rows.get("turnOutline") or {}).get("val") or {}
         # Every row carries the event seq it was last written at; the maximum is
         # the session's persisted position and changes on any new activity.
+        # A `session/title` event is not new content: the panel writes summary
+        # titles back to the Session after a run, and counting that event would
+        # invalidate the bookmark and make the next run re-summarize (and bill)
+        # every renamed Session.
         seq = max(
-            (row.get("seq") or 0 for row in rows.values() if isinstance(row, dict)),
+            (
+                row.get("seq") or 0
+                for name, row in rows.items()
+                if isinstance(row, dict) and name != "title"
+            ),
             default=0,
         )
         sessions[sid] = {

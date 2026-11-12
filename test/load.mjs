@@ -49,6 +49,9 @@ const React = {
   useState(initial) {
     return [typeof initial === "function" ? initial() : initial, () => {}];
   },
+  useRef(initial) {
+    return { current: initial };
+  },
   useEffect(run) {
     run();
   }
@@ -72,7 +75,14 @@ const fakeFiles = {
   }
 };
 const ctx = {
-  remote: { workspaceFiles: fakeFiles },
+  remote: {
+    workspaceFiles: fakeFiles,
+    session: {
+      async rename() {
+        return { ok: true, value: { title: "synced", seq: 1 } };
+      }
+    }
+  },
   effect(run) {
     run();
   },
@@ -87,6 +97,11 @@ const ctx = {
     }
   },
   get(name) {
+    if (name === "sessions") {
+      return {
+        async refresh() {}
+      };
+    }
     assert.equal(name, "uiWorkspace");
     return {
       openSession(sessionId) {
@@ -115,8 +130,17 @@ assert.equal(sidebar.registration.options.id, "session-graph");
 assert.equal(sidebar.registration.options.label(), "会话地图");
 assert.equal(sidebar.registration.Component({ size: 16 }).type, "svg");
 
-main.registration.options.inject().openSession("session-probe");
+const mainProps = main.registration.options.inject();
+mainProps.openSession("session-probe");
 assert.deepEqual(opened, ["session-probe"]);
+assert.equal(typeof mainProps.renameSession, "function", "the panel must receive the session rename hop");
+assert.deepEqual(
+  await mainProps.renameSession("session-a", "synced"),
+  { title: "synced", seq: 1 },
+  "the rename hop must return the host result"
+);
+assert.equal(typeof mainProps.refreshSessions, "function", "the panel must receive the session-list refresh");
+await mainProps.refreshSessions();
 
 const now = Date.now();
 const list = {
@@ -281,6 +305,157 @@ assert.equal(v3.taxonomy.dimensions.length, 1);
 assert.equal(v3.pullRequests[0].state, "OPEN");
 assert.equal(v3.repo, "example/repo");
 
+const titleChanges = client.__test.changedSessionTitles(
+  [
+    { session: "session-a", title: "Old A" },
+    { session: "session-b", title: "Same B" },
+    { session: "session-c", title: "Old C" }
+  ],
+  [
+    { session: "session-a", title: "New A" },
+    { session: "session-b", title: "Same B" },
+    { session: "session-c", title: "New C" },
+    { session: "session-d", title: "Brand new" }
+  ],
+  {
+    "session-a": { displayTitle: "Old A" },
+    "session-b": { displayTitle: "Same B" },
+    "session-c": { displayTitle: "Old C" },
+    "session-d": { displayTitle: "Old D" }
+  }
+);
+assert.deepEqual(titleChanges, [
+  { session: "session-a", title: "New A" },
+  { session: "session-c", title: "New C" }
+], "only known sessions whose title changed should be synced");
+
+assert.deepEqual(
+  client.__test.changedSessionTitles(
+    [{ session: "session-a", title: "Old A" }],
+    [{ session: "session-a", title: "New A" }],
+    { "session-a": { displayTitle: "New A" } }
+  ),
+  [],
+  "a session already carrying the new title must not be renamed again"
+);
+
+assert.deepEqual(
+  client.__test.changedSessionTitles([], [{ session: "session-a", title: "New A" }], {}),
+  [],
+  "an unloaded graph baseline must not rename every session"
+);
+
+assert.deepEqual(
+  client.__test.changedSessionTitles(
+    [{ session: "session-a", title: "Old A", pullRequests: [613] }],
+    [{ session: "session-a", title: "New A", pullRequests: [613] }],
+    { "session-a": { displayTitle: "Old A" } }
+  ),
+  [{ session: "session-a", title: "[#613] New A" }],
+  "the renamed session title must carry the same PR prefix as the card"
+);
+
+assert.deepEqual(
+  client.__test.changedSessionTitles(
+    [{ session: "session-a", title: "Same A", pullRequests: [] }],
+    [{ session: "session-a", title: "Same A", pullRequests: [613] }],
+    { "session-a": { displayTitle: "Same A" } }
+  ),
+  [{ session: "session-a", title: "[#613] Same A" }],
+  "adding a PR association must also refresh the session title prefix"
+);
+
+const syncGraphText = "```json\n" +
+  JSON.stringify({
+    version: 3,
+    sessions: [
+      { session: "session-a", title: "New A", pullRequests: [613] },
+      { session: "session-b", title: "New B" },
+      { session: "session-c", title: "Same C" }
+    ]
+  }) +
+  "\n```";
+const renames = [];
+let sessionRefreshes = 0;
+const syncResult = await client.__test.syncSessionTitles({
+  beforeEntries: [
+    { session: "session-a", title: "Old A", pullRequests: [613] },
+    { session: "session-b", title: "New B" },
+    { session: "session-c", title: "Same C" }
+  ],
+  workspaceFiles: {
+    async read() {
+      return { ok: true, value: { text: syncGraphText } };
+    }
+  },
+  readSessionId: "session-a",
+  filePath: "/repo/DSH_SESSION_GRAPH.md",
+  byId: {
+    "session-a": { displayTitle: "Old A" },
+    "session-b": { displayTitle: "New B" },
+    "session-c": { displayTitle: "Same C" }
+  },
+  renameSession: async (sessionId, title) => {
+    renames.push([sessionId, title]);
+  },
+  refreshSessions: async () => {
+    sessionRefreshes += 1;
+  }
+});
+assert.deepEqual(renames, [["session-a", "[#613] New A"]], "only the changed title is written back, with its PR prefix");
+assert.deepEqual(syncResult, { synced: 1, failed: 0 });
+assert.equal(sessionRefreshes, 1, "the session list is refreshed after a sync");
+
+const reconcileRenames = [];
+const reconcileResult = await client.__test.syncSessionTitles({
+  beforeEntries: [{ session: "session-a", title: "Same A", pullRequests: [613] }],
+  workspaceFiles: {
+    async read() {
+      return {
+        ok: true,
+        value: {
+          text: "```json\n" + JSON.stringify({
+            version: 3,
+            sessions: [{ session: "session-a", title: "Same A", pullRequests: [613] }]
+          }) + "\n```"
+        }
+      };
+    }
+  },
+  readSessionId: "session-a",
+  filePath: "/repo/DSH_SESSION_GRAPH.md",
+  byId: { "session-a": { displayTitle: "Old A" } },
+  renameSession: async (sessionId, title) => {
+    reconcileRenames.push([sessionId, title]);
+  },
+  refreshSessions: async () => {},
+  includeSession: "session-a"
+});
+assert.deepEqual(reconcileRenames, [["session-a", "[#613] Same A"]], "a targeted summarize reconciles an existing mismatch, with the PR prefix");
+assert.deepEqual(reconcileResult, { synced: 1, failed: 0 });
+
+const originalWarn = console.warn;
+console.warn = () => {};
+const failedRename = await client.__test.syncSessionTitles({
+  beforeEntries: [{ session: "session-a", title: "Old A" }],
+  workspaceFiles: {
+    async read() {
+      return { ok: true, value: { text: syncGraphText } };
+    }
+  },
+  readSessionId: "session-a",
+  filePath: "/repo/DSH_SESSION_GRAPH.md",
+  byId: { "session-a": { displayTitle: "Old A" } },
+  renameSession: async () => {
+    throw new Error("rename refused");
+  },
+  refreshSessions: async () => {
+    throw new Error("refresh must not run when every rename failed");
+  }
+});
+console.warn = originalWarn;
+assert.deepEqual(failedRename, { synced: 0, failed: 1 }, "a rename failure must not fail the summary");
+
 const card = client.__test.SessionCard({
   task: {
     session: "session-a",
@@ -352,12 +527,86 @@ const legacy = client.__test.parseSessionGraph(
   "\n```"
 );
 assert.equal(legacy.entries.length, 2);
-const taskLayout = client.__test.layoutTasks([
-  { id: "a", title: "Task A", session: "session-a", status: "done", dependsOn: [] },
-  { id: "b", title: "Task B", session: "session-b", status: "running", dependsOn: ["a"] }
-]);
-assert.equal(taskLayout.nodes.length, 2);
-assert.equal(taskLayout.edges.length, 1);
-assert.ok(taskLayout.nodes[0].x < taskLayout.nodes[1].x, "dependency target must be to the right");
 
-console.log("ok: bundle loads, cards render, taxonomy/PR data parse, click opens sessions");
+const graphTasks = [
+  {
+    session: "session-a",
+    title: "A",
+    displayTitle: "A",
+    summary: "",
+    status: "running",
+    dependsOn: [],
+    dimensions: { labeling: ["prompt"] },
+    pullRequests: [606]
+  },
+  {
+    session: "session-b",
+    title: "B",
+    displayTitle: "B",
+    summary: "",
+    status: "active",
+    dependsOn: ["session-a"],
+    dimensions: { labeling: ["worker"] },
+    pullRequests: []
+  }
+];
+const graph = client.__test.buildKnowledgeGraph(graphTasks, v3.taxonomy, new Map([[606, v3.pullRequests[0]]]), {
+  repo: v3.repo,
+  archived: new Set()
+});
+assert.equal(graph.nodes.filter((node) => node.kind === "session").length, 2);
+assert.equal(graph.nodes.filter((node) => node.kind === "tag").length, 2);
+assert.equal(graph.nodes.filter((node) => node.kind === "pr").length, 1);
+assert.equal(graph.links.filter((link) => link.kind === "dependency").length, 1);
+assert.equal(graph.links.filter((link) => link.kind === "tag").length, 2);
+assert.equal(graph.links.filter((link) => link.kind === "pr").length, 1);
+assert.equal(graph.stats.sessions, 2);
+assert.equal(graph.stats.links, 4);
+assert.ok(graph.nodes.every((node) => node.r > 0), "every graph node gets a radius");
+assert.equal(graph.byId.get("pr:606").url, "https://github.com/example/repo/pull/606");
+
+const localGraph = client.__test.buildKnowledgeGraph(graphTasks, v3.taxonomy, new Map([[606, v3.pullRequests[0]]]), {
+  repo: v3.repo,
+  archived: new Set(),
+  localDepth: 1,
+  focusSession: "session-a"
+});
+assert.ok(localGraph.byId.has("session:session-b"), "depth 1 keeps the dependent session");
+assert.ok(localGraph.byId.has("tag:labeling:prompt"), "depth 1 keeps the focused session tag");
+assert.ok(localGraph.byId.has("pr:606"), "depth 1 keeps the focused session PR");
+assert.ok(!localGraph.byId.has("tag:labeling:worker"), "depth 1 excludes the neighbour's tag");
+
+const noTags = client.__test.buildKnowledgeGraph(graphTasks, v3.taxonomy, new Map([[606, v3.pullRequests[0]]]), {
+  showTags: false,
+  showPrs: false
+});
+assert.equal(noTags.nodes.filter((node) => node.kind === "tag").length, 0);
+assert.equal(noTags.nodes.filter((node) => node.kind === "pr").length, 0);
+
+const graphView = client.__test.GraphView({
+  tasks: graphTasks,
+  taxonomy: v3.taxonomy,
+  prByNumber: new Map([[606, v3.pullRequests[0]]]),
+  repo: v3.repo,
+  archived: new Set(),
+  currentSessionId: "session-a",
+  tr: translate,
+  onOpen: (sessionId) => opened.push(sessionId),
+  onMenu() {}
+});
+const graphNodes = findAll(graphView, (node) => typeof node.props?.className === "string" &&
+  node.props.className.split(" ").includes("dsm-graph-node"));
+assert.equal(graphNodes.length, graph.nodes.length, "the graph renders a node per model node");
+const graphLinks = findAll(graphView, (node) => typeof node.props?.className === "string" &&
+  node.props.className.split(" ").includes("dsm-graph-link"));
+assert.equal(graphLinks.length, graph.links.length, "the graph renders a line per model link");
+const graphToolbar = findOne(graphView, (node) => node.props?.className === "dsm-graph-toolbar");
+assert.ok(graphToolbar, "the graph toolbar is rendered");
+const graphLegend = findOne(graphView, (node) => node.props?.className === "dsm-graph-legend");
+assert.ok(graphLegend, "the graph legend is rendered");
+const sessionNode = graphNodes.find((node) => node.props["aria-label"] === "A, 运行中");
+assert.ok(sessionNode, "session nodes keep their status label");
+sessionNode.props.onClick();
+assert.equal(opened.at(-1), "session-a");
+
+console.log("ok: bundle loads, cards render, knowledge graph builds and renders, taxonomy/PR data parse, click opens sessions");

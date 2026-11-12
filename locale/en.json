@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Session map",
-    "description": "Project sessions as cards with mainline dimensions, tags and PRs, plus /summarize-* summary commands."
+    "description": "Project sessions as cards plus an Obsidian-style knowledge graph, with mainline dimensions, tags, PRs and /summarize-* commands."
   },
   "panel.label": "Session map",
   "page.title": "Session map",

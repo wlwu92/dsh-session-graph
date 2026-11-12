@@ -6,26 +6,16 @@
  * 静态 HTML，再用无头 Chrome 截成 `preview.png`。全程不读取任何真实会话数据，所以截图
  * 可以安全公开。改样式后重跑 `npm run screenshots` 即可让预览跟上。
  */
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { capture, findChrome } from "./capture.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = dirname(here);
 const target = join(root, "preview.png");
 const WIDTH = 1440;
 const HEIGHT = 640;
-
-const CHROMES = [
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  "/Applications/Chromium.app/Contents/MacOS/Chromium",
-  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-  "/usr/bin/google-chrome",
-  "/usr/bin/chromium",
-  "/usr/bin/chromium-browser",
-];
 
 const STATUS_LABELS = { running: "运行中", active: "活跃", archived: "已归档" };
 
@@ -163,7 +153,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica
 </html>`;
 }
 
-const chrome = CHROMES.find((candidate) => existsSync(candidate));
+const chrome = findChrome();
 if (chrome === undefined) {
   console.error("找不到 Chrome/Chromium/Edge；装一个或用 CHROME=/path/to/chrome 指定");
   process.exit(1);
@@ -176,27 +166,6 @@ mkdirSync(outDir, { recursive: true });
 const htmlPath = join(outDir, "preview.html");
 writeFileSync(htmlPath, render(data));
 
-const profile = mkdtempSync(join(tmpdir(), "dsh-preview-"));
-try {
-  execFileSync(browser, [
-    "--headless=new",
-    "--no-sandbox",
-    "--disable-gpu",
-    "--disable-dev-shm-usage",
-    "--disable-crash-reporter",
-    "--disable-breakpad",
-    "--hide-scrollbars",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--force-device-scale-factor=1",
-    `--user-data-dir=${profile}`,
-    `--window-size=${WIDTH},${HEIGHT}`,
-    `--screenshot=${target}`,
-    `file://${htmlPath}`,
-  ], { stdio: ["ignore", "ignore", "pipe"] });
-} finally {
-  rmSync(profile, { recursive: true, force: true });
-}
+await capture(browser, htmlPath, target, WIDTH, HEIGHT);
 
-if (!existsSync(target)) throw new Error(`截图没有生成：${target}`);
 console.log(`wrote ${target} (${WIDTH}x${HEIGHT})`);

@@ -5,7 +5,7 @@
 ```bash
 npm login
 npm test
-npm pack --dry-run     # 确认 tarball 里只有 lib/、locale/、test/、README、LICENSE、preview.png
+npm pack --dry-run     # 确认 tarball 里只有 lib/、locale/、test/、README、LICENSE、preview*.png
 npm publish --access public
 ```
 
@@ -25,6 +25,6 @@ dsh plugin --profile web add github:<user>/dsh-session-graph
 ## 版本
 
 - 语义化版本；`npm version patch|minor|major`；
-- 0.5.1 起 `preview.png` 由 `npm run screenshots` 用 `screenshots/demo.json` 的假数据生成，
-  不要再提交带真实会话的截图；
+- 0.5.1 起 `preview.png` 由 `npm run screenshots` 用 `screenshots/demo.json` 的假数据生成；
+  0.6.0 起同一条命令还会生成 `preview-graph.png`，两张图都不要提交真实会话截图；
 - 依赖 DSH 0.2.x 的会话缓存格式（`storages/session_projcache`），DSH 大版本升级后可能需要跟进。
