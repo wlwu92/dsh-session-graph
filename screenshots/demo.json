@@ -1,0 +1,108 @@
+{
+  "project": "demo-app",
+  "title": "会话地图",
+  "sub": "8 个会话 · 5 条主线 · 2 个关联 PR",
+  "source": "DSH_SESSION_GRAPH.md · 8 个会话 · 2 条依赖",
+  "note": "点击卡片切换 session；先「生成维度」再「生成摘要」，卡片就会带主线标签和 PR。",
+  "search": "搜索标题、摘要、标签或 PR",
+  "buttons": { "refresh": "刷新", "summaries": "生成摘要", "prs": "刷新 PR" },
+  "views": ["卡片", "关系图", "PR"],
+  "showArchived": "显示已归档",
+  "legend": [["running", "运行中"], ["active", "活跃"], ["archived", "已归档"]],
+  "facets": {
+    "title": "主线维度",
+    "all": { "name": "全部会话", "count": 8 },
+    "items": [
+      { "id": "auth", "name": "认证与权限", "count": 3, "color": "#5c7cfa" },
+      { "id": "sync", "name": "数据同步", "count": 2, "color": "#0ca678" },
+      { "id": "ui", "name": "前端界面", "count": 2, "color": "#f08c00" },
+      { "id": "build", "name": "构建发布", "count": 3, "color": "#9c36b5" },
+      { "id": "test", "name": "测试工具", "count": 1, "color": "#1098ad" }
+    ],
+    "tagsTitle": "标签",
+    "allTags": "全部标签",
+    "tags": [
+      { "name": "OAuth", "count": 2 },
+      { "name": "会话", "count": 1 },
+      { "name": "回调", "count": 1 }
+    ],
+    "generate": "生成维度"
+  },
+  "cardsHead": "8 个会话",
+  "currentDimension": "当前主线：认证与权限",
+  "cards": [
+    {
+      "title": "登录鉴权：接入 OAuth 回调",
+      "summary": "把第三方登录回调接到网关，补齐 state 校验与失败重试，登录态统一落到会话表。",
+      "status": "running",
+      "current": true,
+      "id": "s-8f2a1c",
+      "time": "刚刚",
+      "dims": [{ "name": "认证与权限", "color": "#5c7cfa", "tags": ["OAuth", "会话"] }],
+      "prs": []
+    },
+    {
+      "title": "数据同步：重试与去重",
+      "summary": "给同步任务加指数退避和幂等键，重复写入不再产生脏数据，补了回归用例。",
+      "status": "active",
+      "id": "s-2b7d40",
+      "time": "2 小时前",
+      "dims": [{ "name": "数据同步", "color": "#0ca678", "tags": ["重试", "幂等"] }],
+      "prs": [{ "number": 121, "state": "merged" }]
+    },
+    {
+      "title": "构建发布：缓存命中优化",
+      "summary": "调整构建缓存 key，冷构建从 6 分钟降到 2 分钟，发布流水线复用同一份产物。",
+      "status": "active",
+      "id": "s-91c3aa",
+      "time": "3 小时前",
+      "dims": [{ "name": "构建发布", "color": "#9c36b5", "tags": ["缓存"] }],
+      "prs": [{ "number": 130, "state": "open" }]
+    },
+    {
+      "title": "前端界面：表格分页重构",
+      "summary": "把列表页改成服务端分页，抽出行高与选中态逻辑，键盘操作不再丢焦点。",
+      "status": "active",
+      "id": "s-4e0b7f",
+      "time": "4 小时前",
+      "dims": [{ "name": "前端界面", "color": "#f08c00", "tags": ["分页", "交互"] }],
+      "prs": []
+    },
+    {
+      "title": "测试工具：fixture 生成器",
+      "summary": "加了一个按 schema 生成测试数据的脚本，fixture 不再手写，评测集可以复现。",
+      "status": "active",
+      "id": "s-7c5e12",
+      "time": "5 小时前",
+      "dims": [{ "name": "测试工具", "color": "#1098ad", "tags": ["fixture"] }],
+      "prs": []
+    },
+    {
+      "title": "日志：结构化字段补齐",
+      "summary": "统一请求日志里的 trace_id、耗时和状态码字段，排查时可以直接按链路过滤。",
+      "status": "active",
+      "id": "s-3f9a05",
+      "time": "6 小时前",
+      "dims": [{ "name": "构建发布", "color": "#9c36b5", "tags": ["日志"] }],
+      "prs": []
+    },
+    {
+      "title": "部署：灰度开关",
+      "summary": "给新版本加灰度比例开关，按用户分桶放量，回滚只改配置不动镜像。",
+      "status": "archived",
+      "id": "s-a1d8b6",
+      "time": "昨天",
+      "dims": [{ "name": "构建发布", "color": "#9c36b5", "tags": ["灰度"] }],
+      "prs": [{ "number": 118, "state": "merged" }]
+    },
+    {
+      "title": "文档：本地开发指南",
+      "summary": "补齐本地起服务的步骤、常用脚本和排查清单，新人按文档能跑通全流程。",
+      "status": "active",
+      "id": "s-6b2f90",
+      "time": "昨天",
+      "dims": [{ "name": "前端界面", "color": "#f08c00", "tags": ["文档"] }],
+      "prs": []
+    }
+  ]
+}

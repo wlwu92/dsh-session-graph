@@ -1,0 +1,15 @@
+{
+  "meta": {
+    "title": "会话地图",
+    "description": "按项目主线维度、标签和 PR 展示会话卡片，并提供 /summarize-* 摘要命令。"
+  },
+  "panel.label": "会话地图",
+  "page.title": "会话地图",
+  "page.sub": "{count} 个会话 · {dimensions} 条主线 · {prs} 个 PR",
+  "page.showArchived": "显示已归档",
+  "page.running": "运行中",
+  "page.active": "活跃",
+  "page.archived": "已归档",
+  "page.empty": "没有可显示的会话。",
+  "page.note": "按项目主线维度与标签展示会话卡片；数据来自项目的 DSH_SESSION_GRAPH.md。"
+}

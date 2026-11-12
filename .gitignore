@@ -1,0 +1,7 @@
+# 依赖与构建产物
+node_modules/
+*.tgz
+.DS_Store
+
+# 截图生成的中间文件（preview.png 本身要提交）
+screenshots/out/

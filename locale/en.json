@@ -1,0 +1,15 @@
+{
+  "meta": {
+    "title": "Session map",
+    "description": "Project sessions as cards with mainline dimensions, tags and PRs, plus /summarize-* summary commands."
+  },
+  "panel.label": "Session map",
+  "page.title": "Session map",
+  "page.sub": "{count} sessions · {dimensions} mainlines · {prs} PRs",
+  "page.showArchived": "Show archived",
+  "page.running": "Running",
+  "page.active": "Active",
+  "page.archived": "Archived",
+  "page.empty": "No sessions to show.",
+  "page.note": "Project sessions as cards with mainline dimensions and tags; data comes from the project DSH_SESSION_GRAPH.md."
+}
