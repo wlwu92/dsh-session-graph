@@ -128,9 +128,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica
   </header>
   <div class="dsm-toolbar">
     <select class="dsm-project-select"><option>${esc(data.project)}</option></select>
+    <input class="dsm-search" type="search" placeholder="${esc(data.search)}">
     <button class="dsm-btn primary" type="button">${esc(data.buttons.summaries)}</button>
     <span class="dsm-spacer"></span>
-    <input class="dsm-search" type="search" placeholder="${esc(data.search)}">
     <div class="dsm-seg">${views}</div>
     <label class="dsm-toggle"><input type="checkbox">${esc(data.showArchived)}</label>
     <div class="dsm-legend">${legend}</div>

@@ -258,6 +258,9 @@ assert.deepEqual(names, ["Alpha", "Beta", "Fork"]);
 
 const toolbar = findOne(page, (node) => node.props?.className === "dsm-toolbar");
 assert.ok(toolbar, "the toolbar is rendered");
+const toolbarItems = Array.isArray(toolbar.children[0]) ? toolbar.children[0] : toolbar.children;
+assert.equal(toolbarItems[0].type, "select", "the project picker leads the toolbar");
+assert.equal(toolbarItems[1].props?.className, "dsm-search", "the search field sits next to the project picker");
 const toolbarButtonLabels = findAll(toolbar, (node) => node.type === "button").map((button) => button.children?.[0]);
 assert.deepEqual(toolbarButtonLabels, ["生成摘要", "卡片", "PR"], "the toolbar keeps the summary action and view switch only");
 assert.ok(!toolbarButtonLabels.includes("刷新"), "the panel refreshes itself instead of exposing a refresh button");
@@ -298,6 +301,19 @@ assert.equal(
   "",
   "a finished progress file must not replace the final command result"
 );
+
+const searchChanges = [];
+const searchField = client.__test.SearchInput({
+  className: "dsm-search",
+  placeholder: "search",
+  value: "",
+  resetKey: 0,
+  onValueChange: (value) => searchChanges.push(value)
+});
+assert.equal(searchField.props.value, undefined, "the search field is uncontrolled so re-renders cannot erase the first keystroke");
+searchField.props.onInput({ currentTarget: { value: "a" } });
+searchField.props.onKeyUp({ currentTarget: { value: "ab" } });
+assert.deepEqual(searchChanges, ["a", "ab"], "both input and keyup paths publish the current text");
 
 const v3 = client.__test.parseSessionGraph(
   "```json\n" +
