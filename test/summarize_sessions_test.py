@@ -505,6 +505,23 @@ class MainPipelineTest(unittest.TestCase):
         self.assertEqual(data["completed"], 1)
         self.assertIn("updatedAt", data)
 
+    def test_progress_total_excludes_up_to_date_sessions(self) -> None:
+        self.run_main("--force")
+        reports = []
+        original = summarizer.write_progress
+        summarizer.write_progress = (  # type: ignore[assignment]
+            lambda _path, **fields: reports.append(fields)
+        )
+        try:
+            self.run_main()
+        finally:
+            summarizer.write_progress = original  # type: ignore[assignment]
+        session_reports = [item for item in reports if item.get("phase") == "sessions"]
+        self.assertTrue(session_reports, "the session phase must still be published")
+        self.assertEqual(session_reports[0]["total"], 0, "an up-to-date session is not pending work")
+        self.assertEqual(session_reports[0]["skipped"], 1)
+        self.assertEqual(reports[-1]["total"], 0)
+
     def test_progress_reports_total_and_completed_sessions(self) -> None:
         reports = []
         original = summarizer.write_progress

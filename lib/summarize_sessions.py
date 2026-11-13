@@ -1708,6 +1708,23 @@ def main() -> None:
     failed: list[str] = []
     tag_sessions = args.mode in ("sessions", "all")
     taxonomy_updated = str((payload.get("taxonomy") or {}).get("updatedAt") or "")
+
+    # Resolve freshness before publishing progress: the panel should say how
+    # many sessions actually need a model call, not how many candidates exist.
+    pending: list[dict] = []
+    if tag_sessions:
+        for session in candidates:
+            entry = existing.get(session["id"])
+            if not args.force and summary_is_current(entry, session, taxonomy_updated):
+                skipped.append(session["id"])
+                if args.write and isinstance(entry, dict) and "summarizedTurnSeq" not in entry:
+                    entry["summarizedTurnSeq"] = int(session.get("turnSeq") or 0)
+            else:
+                pending.append(session)
+    progress_total = len(pending) if tag_sessions else 1
+    if skipped:
+        say(f"\nskipped {len(skipped)} unchanged session(s) (--force to redo)")
+
     if progress_enabled and tag_sessions:
         write_progress(
             progress_path,
@@ -1715,11 +1732,11 @@ def main() -> None:
             phase="sessions",
             total=progress_total,
             completed=0,
-            skipped=0,
+            skipped=len(skipped),
             failed=0,
             current="",
         )
-    for position, session in enumerate(candidates if tag_sessions else [], start=1):
+    for position, session in enumerate(pending, start=1):
         if USAGE["auth_failed"]:
             break
         if progress_enabled:
@@ -1734,23 +1751,6 @@ def main() -> None:
                 current=str(session.get("title") or session["id"]),
             )
         entry = existing.get(session["id"])
-        if not args.force and summary_is_current(entry, session, taxonomy_updated):
-            skipped.append(session["id"])
-            if args.write and isinstance(entry, dict) and "summarizedTurnSeq" not in entry:
-                entry["summarizedTurnSeq"] = int(session.get("turnSeq") or 0)
-            say(f"\n--- {session['id']}  unchanged; keep existing summary (--force to redo)")
-            if progress_enabled:
-                write_progress(
-                    progress_path,
-                    state="running",
-                    phase="sessions",
-                    total=progress_total,
-                    completed=position,
-                    skipped=len(skipped),
-                    failed=len(failed),
-                    current="",
-                )
-            continue
         rebuild = (
             args.force
             or not isinstance(entry, dict)
