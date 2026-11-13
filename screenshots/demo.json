@@ -9,7 +9,7 @@
     "summaries": "生成摘要"
   },
   "views": [
-    "卡片",
+    "会话",
     "PR"
   ],
   "showArchived": "显示已归档",

@@ -262,11 +262,11 @@ const toolbarItems = Array.isArray(toolbar.children[0]) ? toolbar.children[0] : 
 assert.equal(toolbarItems[0].type, "select", "the project picker leads the toolbar");
 assert.equal(toolbarItems[1].props?.className, "dsm-search", "the search field sits next to the project picker");
 const toolbarButtonLabels = findAll(toolbar, (node) => node.type === "button").map((button) => button.children?.[0]);
-assert.deepEqual(toolbarButtonLabels, ["生成摘要", "卡片", "PR"], "the toolbar keeps the summary action and view switch only");
+assert.deepEqual(toolbarButtonLabels, ["生成摘要", "会话", "PR"], "the toolbar keeps the summary action and view switch only");
 assert.ok(!toolbarButtonLabels.includes("刷新"), "the panel refreshes itself instead of exposing a refresh button");
 const viewSwitch = findOne(page, (node) => node.props?.className === "dsm-seg");
 const viewLabels = findAll(viewSwitch, (node) => node.type === "button").map((button) => button.children?.[0]);
-assert.deepEqual(viewLabels, ["卡片", "PR"], "the knowledge graph view is gone");
+assert.deepEqual(viewLabels, ["会话", "PR"], "the cards view is labelled Sessions");
 assert.ok(!client.__test.CSS.includes("dsm-graph"), "graph styles are removed with the graph view");
 assert.ok(!findOne(page, (node) => node.props?.className === "dsm-cards-head"), "the cards header no longer takes a row");
 const statusRow = findOne(page, (node) => typeof node.props?.className === "string" &&
