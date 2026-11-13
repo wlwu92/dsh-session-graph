@@ -45,7 +45,8 @@
   },
   "scripts": {
     "test": "node test/load.mjs && node test/host.mjs && python3 test/summarize_sessions_test.py",
-    "screenshots": "node screenshots/build.mjs"
+    "screenshots": "node screenshots/build.mjs",
+    "prepack": "node -e \"require('node:fs').rmSync('lib/__pycache__', { recursive: true, force: true })\""
   },
   "dsh": {
     "client": {
