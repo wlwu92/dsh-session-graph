@@ -6,7 +6,6 @@
   "note": "点击卡片切换 session；先「生成维度」再「生成摘要」，卡片就会带主线标签和 PR。",
   "search": "搜索标题、摘要、标签或 PR",
   "buttons": {
-    "refresh": "刷新",
     "summaries": "生成摘要"
   },
   "views": [
