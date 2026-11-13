@@ -39,7 +39,7 @@ const ctx = {
 
 apply(ctx);
 
-assert.equal(effects.length, 4, "each command registers through ctx.effect");
+assert.equal(effects.length, 5, "four commands plus the background PR refresh register through ctx.effect");
 assert.deepEqual(
   registered.map((command) => command.name),
   ["summarize-taxonomy", "summarize-prs", "summarize-project", "summarize-session"]

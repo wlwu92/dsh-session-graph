@@ -31,8 +31,9 @@ summary plus only the newer turns. Pass --force to redo an up-to-date session
 from a full rebuild.
 
 GitHub is a background concern: summarization never calls `gh`. The catalog is
-refreshed by `--mode prs` (also used by `/summarize-prs`) and by a detached
-refresh spawned after a summary run, throttled by `prUpdatedAt`.
+refreshed by `--mode prs` (also used by `/summarize-prs`), by a detached refresh
+spawned after a summary run, and by the Host's 90-second background timer; the
+latter two pass `--if-stale` so `prUpdatedAt` throttles repeated `gh` calls.
 
 Archived sessions are frozen: they are skipped by default (even with --all and
 even when the graph file already lists them). Pass --include-archived to
@@ -91,7 +92,7 @@ MAX_SUMMARY_TOKENS = 20_000
 PR_EVIDENCE_LIMIT = 12
 RECENT_OUTPUT_CHARS = 2_000
 USER_MESSAGE_CHARS = 8_000
-PR_BACKGROUND_REFRESH_SECONDS = 10 * 60
+PR_BACKGROUND_REFRESH_SECONDS = 60
 CONTENT_EVENT_TYPES = {"user/message", "assistant/message", "turn/end"}
 AUTH_ERROR_RE = re.compile(r"\bHTTP (?:401|403)\b|authentication", re.IGNORECASE)
 PR_URL_RE = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)", re.IGNORECASE)
@@ -1397,6 +1398,11 @@ def main() -> None:
         action="store_true",
         help="do not refresh the PR catalog (foreground or background)",
     )
+    parser.add_argument(
+        "--if-stale",
+        action="store_true",
+        help="for --mode prs: skip when prUpdatedAt is newer than the refresh interval",
+    )
     parser.add_argument("--write", action="store_true", help="call the model and update the graph file")
     parser.add_argument(
         "--base-url",
@@ -1440,6 +1446,9 @@ def main() -> None:
     repo = str(payload.get("repo") or "").strip() or detect_repo(project)
 
     if args.mode == "prs":
+        if args.if_stale and not pr_catalog_is_stale(payload):
+            say("PR catalog is fresh; skipping")
+            return
         if not args.write:
             say("dry-run: no GitHub call, no file writes; add --write to apply")
             return

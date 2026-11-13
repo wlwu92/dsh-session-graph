@@ -421,6 +421,27 @@ class MainPipelineTest(unittest.TestCase):
         finally:
             sys.argv = original_argv
 
+    def run_prs(self, *extra: str) -> None:
+        original_argv = sys.argv
+        sys.argv = [
+            "summarize_sessions",
+            "--project",
+            str(self.project),
+            "--graph",
+            str(self.graph),
+            "--dsh-home",
+            str(self.home),
+            "--mode",
+            "prs",
+            "--write",
+            "--quiet",
+            *extra,
+        ]
+        try:
+            summarizer.main()
+        finally:
+            sys.argv = original_argv
+
     def test_summary_owns_pr_association_and_bookmarks(self) -> None:
         self.run_main("--force")
         payload = self.read_graph()
@@ -472,6 +493,39 @@ class MainPipelineTest(unittest.TestCase):
         self.assertEqual(entry["pullRequests"], [646, 700])
         self.assertEqual(entry["summarizedTurnSeq"], 42)
         self.assertEqual(entry["summarizedSeq"], 52)
+
+    def test_pr_refresh_if_stale_skips_a_fresh_catalog(self) -> None:
+        payload = self.read_graph()
+        payload["prUpdatedAt"] = summarizer.now_iso()
+        self.write_graph(payload)
+        original = summarizer.gh_pr_catalog
+        summarizer.gh_pr_catalog = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[assignment]
+            AssertionError("a fresh catalog must not call gh")
+        )
+        try:
+            self.run_prs("--if-stale")
+        finally:
+            summarizer.gh_pr_catalog = original  # type: ignore[assignment]
+        self.assertIn("prUpdatedAt", self.read_graph())
+
+    def test_pr_refresh_if_stale_refreshes_an_old_catalog(self) -> None:
+        payload = self.read_graph()
+        payload["prUpdatedAt"] = "2020-01-01T00:00:00+00:00"
+        self.write_graph(payload)
+        calls = []
+
+        def fake_catalog(repo: str, limit: int = 300) -> list[dict]:
+            calls.append((repo, limit))
+            return [{"number": 646, "title": "ship it", "state": "MERGED", "url": ""}]
+
+        original = summarizer.gh_pr_catalog
+        summarizer.gh_pr_catalog = fake_catalog  # type: ignore[assignment]
+        try:
+            self.run_prs("--if-stale")
+        finally:
+            summarizer.gh_pr_catalog = original  # type: ignore[assignment]
+        self.assertEqual(calls, [("acme/demo", 300)])
+        self.assertEqual(self.read_graph()["pullRequests"][0]["state"], "MERGED")
 
     def test_single_turn_summary_refreshes_after_the_turn_ends(self) -> None:
         # The session's only turn is still running when the user promotes it.

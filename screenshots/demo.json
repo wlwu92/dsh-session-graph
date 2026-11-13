@@ -2,17 +2,15 @@
   "project": "demo-app",
   "title": "会话地图",
   "sub": "8 个会话 · 5 条主线 · 3 个关联 PR",
-  "source": "DSH_SESSION_GRAPH.md · 8 个会话 · 5 条依赖",
+  "source": "DSH_SESSION_GRAPH.md · 8 个会话",
   "note": "点击卡片切换 session；先「生成维度」再「生成摘要」，卡片就会带主线标签和 PR。",
   "search": "搜索标题、摘要、标签或 PR",
   "buttons": {
     "refresh": "刷新",
-    "summaries": "生成摘要",
-    "prs": "刷新 PR"
+    "summaries": "生成摘要"
   },
   "views": [
     "卡片",
-    "知识图谱",
     "PR"
   ],
   "showArchived": "显示已归档",

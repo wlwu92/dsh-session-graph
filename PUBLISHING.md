@@ -26,5 +26,5 @@ dsh plugin --profile web add github:<user>/dsh-session-graph
 
 - 语义化版本；`npm version patch|minor|major`；
 - 0.5.1 起 `preview.png` 由 `npm run screenshots` 用 `screenshots/demo.json` 的假数据生成；
-  0.6.0 起同一条命令还会生成 `preview-graph.png`，两张图都不要提交真实会话截图；
+  不要提交真实会话截图；
 - 依赖 DSH 0.2.x 的会话缓存格式（`storages/session_projcache`），DSH 大版本升级后可能需要跟进。

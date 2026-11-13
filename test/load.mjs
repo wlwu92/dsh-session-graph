@@ -256,6 +256,15 @@ const cardTitle = (card) => findOne(card, (node) => node.props?.className === "d
 const names = cards.map(cardTitle).sort();
 assert.deepEqual(names, ["Alpha", "Beta", "Fork"]);
 
+const toolbar = findOne(page, (node) => node.props?.className === "dsm-toolbar");
+assert.ok(toolbar, "the toolbar is rendered");
+const toolbarButtonLabels = findAll(toolbar, (node) => node.type === "button").map((button) => button.children?.[0]);
+assert.ok(!toolbarButtonLabels.includes("刷新 PR"), "PR refresh is folded into the summary action");
+const viewSwitch = findOne(page, (node) => node.props?.className === "dsm-seg");
+const viewLabels = findAll(viewSwitch, (node) => node.type === "button").map((button) => button.children?.[0]);
+assert.deepEqual(viewLabels, ["卡片", "PR"], "the knowledge graph view is gone");
+assert.ok(!client.__test.CSS.includes("dsm-graph"), "graph styles are removed with the graph view");
+
 const alpha = cards.find((card) => cardTitle(card) === "Alpha");
 alpha.props.onClick();
 assert.equal(opened.at(-1), "session-a");
@@ -503,9 +512,7 @@ const prPanel = client.__test.PrPanel({
   }],
   repo: v3.repo,
   tr: translate,
-  onOpenSession: (sessionId) => opened.push(sessionId),
-  onRefresh() {},
-  busy: false
+  onOpenSession: (sessionId) => opened.push(sessionId)
 });
 const prRows = findAll(prPanel, (node) => typeof node.props?.className === "string" &&
   node.props.className.split(" ").includes("dsm-pr-row"));
@@ -528,85 +535,4 @@ const legacy = client.__test.parseSessionGraph(
 );
 assert.equal(legacy.entries.length, 2);
 
-const graphTasks = [
-  {
-    session: "session-a",
-    title: "A",
-    displayTitle: "A",
-    summary: "",
-    status: "running",
-    dependsOn: [],
-    dimensions: { labeling: ["prompt"] },
-    pullRequests: [606]
-  },
-  {
-    session: "session-b",
-    title: "B",
-    displayTitle: "B",
-    summary: "",
-    status: "active",
-    dependsOn: ["session-a"],
-    dimensions: { labeling: ["worker"] },
-    pullRequests: []
-  }
-];
-const graph = client.__test.buildKnowledgeGraph(graphTasks, v3.taxonomy, new Map([[606, v3.pullRequests[0]]]), {
-  repo: v3.repo,
-  archived: new Set()
-});
-assert.equal(graph.nodes.filter((node) => node.kind === "session").length, 2);
-assert.equal(graph.nodes.filter((node) => node.kind === "tag").length, 2);
-assert.equal(graph.nodes.filter((node) => node.kind === "pr").length, 1);
-assert.equal(graph.links.filter((link) => link.kind === "dependency").length, 1);
-assert.equal(graph.links.filter((link) => link.kind === "tag").length, 2);
-assert.equal(graph.links.filter((link) => link.kind === "pr").length, 1);
-assert.equal(graph.stats.sessions, 2);
-assert.equal(graph.stats.links, 4);
-assert.ok(graph.nodes.every((node) => node.r > 0), "every graph node gets a radius");
-assert.equal(graph.byId.get("pr:606").url, "https://github.com/example/repo/pull/606");
-
-const localGraph = client.__test.buildKnowledgeGraph(graphTasks, v3.taxonomy, new Map([[606, v3.pullRequests[0]]]), {
-  repo: v3.repo,
-  archived: new Set(),
-  localDepth: 1,
-  focusSession: "session-a"
-});
-assert.ok(localGraph.byId.has("session:session-b"), "depth 1 keeps the dependent session");
-assert.ok(localGraph.byId.has("tag:labeling:prompt"), "depth 1 keeps the focused session tag");
-assert.ok(localGraph.byId.has("pr:606"), "depth 1 keeps the focused session PR");
-assert.ok(!localGraph.byId.has("tag:labeling:worker"), "depth 1 excludes the neighbour's tag");
-
-const noTags = client.__test.buildKnowledgeGraph(graphTasks, v3.taxonomy, new Map([[606, v3.pullRequests[0]]]), {
-  showTags: false,
-  showPrs: false
-});
-assert.equal(noTags.nodes.filter((node) => node.kind === "tag").length, 0);
-assert.equal(noTags.nodes.filter((node) => node.kind === "pr").length, 0);
-
-const graphView = client.__test.GraphView({
-  tasks: graphTasks,
-  taxonomy: v3.taxonomy,
-  prByNumber: new Map([[606, v3.pullRequests[0]]]),
-  repo: v3.repo,
-  archived: new Set(),
-  currentSessionId: "session-a",
-  tr: translate,
-  onOpen: (sessionId) => opened.push(sessionId),
-  onMenu() {}
-});
-const graphNodes = findAll(graphView, (node) => typeof node.props?.className === "string" &&
-  node.props.className.split(" ").includes("dsm-graph-node"));
-assert.equal(graphNodes.length, graph.nodes.length, "the graph renders a node per model node");
-const graphLinks = findAll(graphView, (node) => typeof node.props?.className === "string" &&
-  node.props.className.split(" ").includes("dsm-graph-link"));
-assert.equal(graphLinks.length, graph.links.length, "the graph renders a line per model link");
-const graphToolbar = findOne(graphView, (node) => node.props?.className === "dsm-graph-toolbar");
-assert.ok(graphToolbar, "the graph toolbar is rendered");
-const graphLegend = findOne(graphView, (node) => node.props?.className === "dsm-graph-legend");
-assert.ok(graphLegend, "the graph legend is rendered");
-const sessionNode = graphNodes.find((node) => node.props["aria-label"] === "A, 运行中");
-assert.ok(sessionNode, "session nodes keep their status label");
-sessionNode.props.onClick();
-assert.equal(opened.at(-1), "session-a");
-
-console.log("ok: bundle loads, cards render, knowledge graph builds and renders, taxonomy/PR data parse, click opens sessions");
+console.log("ok: bundle loads, cards render, taxonomy/PR data parse, click opens sessions");
