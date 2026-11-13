@@ -494,6 +494,34 @@ class MainPipelineTest(unittest.TestCase):
         self.assertEqual(entry["summarizedTurnSeq"], 42)
         self.assertEqual(entry["summarizedSeq"], 52)
 
+    def test_progress_file_is_written_for_the_panel(self) -> None:
+        self.run_main("--force")
+        progress_path = self.project / summarizer.PROGRESS_FILENAME
+        self.assertTrue(progress_path.exists(), "the panel needs a progress file while the command runs")
+        data = json.loads(progress_path.read_text())
+        self.assertEqual(data["state"], "done")
+        self.assertEqual(data["phase"], "done")
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["completed"], 1)
+        self.assertIn("updatedAt", data)
+
+    def test_progress_reports_total_and_completed_sessions(self) -> None:
+        reports = []
+        original = summarizer.write_progress
+        summarizer.write_progress = (  # type: ignore[assignment]
+            lambda _path, **fields: reports.append(fields)
+        )
+        try:
+            self.run_main("--force")
+        finally:
+            summarizer.write_progress = original  # type: ignore[assignment]
+        session_reports = [item for item in reports if item.get("phase") == "sessions"]
+        self.assertTrue(session_reports, "session progress must be published")
+        self.assertEqual(session_reports[0]["total"], 1)
+        self.assertTrue(any(item.get("completed") == 1 for item in session_reports))
+        self.assertTrue(any(item.get("current") for item in session_reports))
+        self.assertEqual(reports[-1]["phase"], "done")
+
     def test_pr_refresh_if_stale_skips_a_fresh_catalog(self) -> None:
         payload = self.read_graph()
         payload["prUpdatedAt"] = summarizer.now_iso()

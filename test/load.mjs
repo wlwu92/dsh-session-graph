@@ -269,6 +269,30 @@ const alpha = cards.find((card) => cardTitle(card) === "Alpha");
 alpha.props.onClick();
 assert.equal(opened.at(-1), "session-a");
 
+assert.equal(
+  client.__test.progressMessage(
+    { phase: "sessions", total: 29, completed: 3, current: "Alpha" },
+    translate
+  ),
+  "正在生成摘要 3/29 · Alpha",
+  "session progress shows the completed and total counts"
+);
+assert.equal(
+  client.__test.progressMessage({ phase: "taxonomy" }, translate),
+  "正在生成项目维度…",
+  "taxonomy progress has its own phase label"
+);
+assert.equal(
+  client.__test.progressMessage({ phase: "sessions", total: 0 }, translate),
+  "正在生成会话摘要与标签…",
+  "zero-total progress falls back to the running label"
+);
+assert.equal(
+  client.__test.progressMessage({ phase: "done" }, translate),
+  "",
+  "a finished progress file must not replace the final command result"
+);
+
 const v3 = client.__test.parseSessionGraph(
   "```json\n" +
   JSON.stringify({

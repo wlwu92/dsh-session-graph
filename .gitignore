@@ -5,5 +5,8 @@ node_modules/
 __pycache__/
 *.pyc
 
+# 摘要命令的临时进度文件
+.dsh-session-graph.progress.json
+
 # 截图生成的中间文件（preview.png 本身要提交）
 screenshots/out/

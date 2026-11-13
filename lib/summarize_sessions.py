@@ -57,6 +57,7 @@ seq never changes again.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
@@ -93,6 +94,7 @@ PR_EVIDENCE_LIMIT = 12
 RECENT_OUTPUT_CHARS = 2_000
 USER_MESSAGE_CHARS = 8_000
 PR_BACKGROUND_REFRESH_SECONDS = 60
+PROGRESS_FILENAME = ".dsh-session-graph.progress.json"
 CONTENT_EVENT_TYPES = {"user/message", "assistant/message", "turn/end"}
 AUTH_ERROR_RE = re.compile(r"\bHTTP (?:401|403)\b|authentication", re.IGNORECASE)
 PR_URL_RE = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)", re.IGNORECASE)
@@ -1311,6 +1313,19 @@ def write_graph_file(graph_path: Path, text: str, payload: dict) -> None:
     os.replace(tmp, graph_path)
 
 
+def write_progress(path: Path, **fields: object) -> None:
+    """Publish machine-readable progress for the panel's busy status line."""
+    payload = {**fields, "updatedAt": now_iso()}
+    try:
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False))
+        os.replace(tmp, path)
+    except OSError:
+        # Progress is best-effort; never fail a summary because the panel file
+        # cannot be written (read-only project, removed directory, ...).
+        pass
+
+
 def pr_catalog_is_stale(payload: dict, seconds: int = PR_BACKGROUND_REFRESH_SECONDS) -> bool:
     stamp = str(payload.get("prUpdatedAt") or "")
     if stamp == "":
@@ -1423,12 +1438,24 @@ def main() -> None:
         help="model credential: DSH account token, API key, or try both (auto)",
     )
     parser.add_argument("--timeout", type=int, default=90)
+    parser.add_argument(
+        "--progress",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--quiet", action="store_true", help="suppress progress output")
     args = parser.parse_args()
     say = (lambda *values, **kwargs: None) if args.quiet else print
 
     project = args.project.resolve()
     graph_path = args.graph or (project / "DSH_SESSION_GRAPH.md")
+    progress_path = args.progress or (project / PROGRESS_FILENAME)
+    progress_enabled = bool(
+        args.write and args.mode in ("sessions", "all", "taxonomy")
+    )
+    if progress_enabled:
+        atexit.register(lambda: progress_path.unlink(missing_ok=True))
     home = args.dsh_home.expanduser()
     if not (home / "storages" / "workspace.json").exists():
         raise SystemExit(
@@ -1529,6 +1556,19 @@ def main() -> None:
     say(f"graph:   {graph_path}")
     say(f"sessions: {len(candidates)} (mode={args.mode}, write={args.write})")
 
+    progress_total = len(candidates) if args.mode in ("sessions", "all") else 1
+    if progress_enabled:
+        write_progress(
+            progress_path,
+            state="running",
+            phase="start",
+            total=progress_total,
+            completed=0,
+            skipped=0,
+            failed=0,
+            current="",
+        )
+
     api_key = credential_from_file(home, args.api_key_env)
     key_source = f"{home / '.credentials.yaml'} refs.{args.api_key_env}" if api_key else ""
     if not api_key:
@@ -1584,6 +1624,17 @@ def main() -> None:
         args.mode in ("taxonomy", "all") or (args.mode == "sessions" and args.refresh_taxonomy)
     )
     if refresh_taxonomy:
+        if progress_enabled:
+            write_progress(
+                progress_path,
+                state="running",
+                phase="taxonomy",
+                total=1,
+                completed=0,
+                skipped=0,
+                failed=0,
+                current="",
+            )
         entries = build_taxonomy_entries(taxonomy_candidates, existing, home, args.limit)
         prompt = taxonomy_prompt(project, entries, catalog)
         print("\n--- taxonomy prompt ---")
@@ -1620,6 +1671,17 @@ def main() -> None:
             return
 
     if args.mode in ("sessions", "all") and taxonomy is None and args.write:
+        if progress_enabled:
+            write_progress(
+                progress_path,
+                state="running",
+                phase="taxonomy",
+                total=1,
+                completed=0,
+                skipped=0,
+                failed=0,
+                current="",
+            )
         print("\ntaxonomy is missing; generating it before session tagging", file=sys.stderr)
         entries = build_taxonomy_entries(taxonomy_candidates, existing, home, args.limit)
         prompt = taxonomy_prompt(project, entries, catalog)
@@ -1646,15 +1708,48 @@ def main() -> None:
     failed: list[str] = []
     tag_sessions = args.mode in ("sessions", "all")
     taxonomy_updated = str((payload.get("taxonomy") or {}).get("updatedAt") or "")
-    for session in (candidates if tag_sessions else []):
+    if progress_enabled and tag_sessions:
+        write_progress(
+            progress_path,
+            state="running",
+            phase="sessions",
+            total=progress_total,
+            completed=0,
+            skipped=0,
+            failed=0,
+            current="",
+        )
+    for position, session in enumerate(candidates if tag_sessions else [], start=1):
         if USAGE["auth_failed"]:
             break
+        if progress_enabled:
+            write_progress(
+                progress_path,
+                state="running",
+                phase="sessions",
+                total=progress_total,
+                completed=position - 1,
+                skipped=len(skipped),
+                failed=len(failed),
+                current=str(session.get("title") or session["id"]),
+            )
         entry = existing.get(session["id"])
         if not args.force and summary_is_current(entry, session, taxonomy_updated):
             skipped.append(session["id"])
             if args.write and isinstance(entry, dict) and "summarizedTurnSeq" not in entry:
                 entry["summarizedTurnSeq"] = int(session.get("turnSeq") or 0)
             say(f"\n--- {session['id']}  unchanged; keep existing summary (--force to redo)")
+            if progress_enabled:
+                write_progress(
+                    progress_path,
+                    state="running",
+                    phase="sessions",
+                    total=progress_total,
+                    completed=position,
+                    skipped=len(skipped),
+                    failed=len(failed),
+                    current="",
+                )
             continue
         rebuild = (
             args.force
@@ -1686,11 +1781,33 @@ def main() -> None:
         )
         if raw is None:
             failed.append(session["id"])
+            if progress_enabled:
+                write_progress(
+                    progress_path,
+                    state="running",
+                    phase="sessions",
+                    total=progress_total,
+                    completed=position,
+                    skipped=len(skipped),
+                    failed=len(failed),
+                    current="",
+                )
             continue
         parsed = parse_session_output(raw, taxonomy, evidence_numbers)
         if parsed is None:
             print("  model returned no usable labels; keep existing values", file=sys.stderr)
             failed.append(session["id"])
+            if progress_enabled:
+                write_progress(
+                    progress_path,
+                    state="running",
+                    phase="sessions",
+                    total=progress_total,
+                    completed=position,
+                    skipped=len(skipped),
+                    failed=len(failed),
+                    current="",
+                )
             continue
         if entry is None:
             entry = {
@@ -1742,6 +1859,17 @@ def main() -> None:
         say(f"  summary: {entry.get('summary', '')[:160]}")
         say(f"  dimensions: {json.dumps(entry.get('dimensions', {}), ensure_ascii=False)}")
         say(f"  prs: {entry.get('pullRequests', [])}")
+        if progress_enabled:
+            write_progress(
+                progress_path,
+                state="running",
+                phase="sessions",
+                total=progress_total,
+                completed=position,
+                skipped=len(skipped),
+                failed=len(failed),
+                current="",
+            )
 
     # Edges are inferred from titles/summaries, so an up-to-date project needs no
     # relation call; retry only when some entry has no dependsOn yet.
@@ -1765,6 +1893,17 @@ def main() -> None:
                 }
             )
         if relation_entries:
+            if progress_enabled:
+                write_progress(
+                    progress_path,
+                    state="running",
+                    phase="relations",
+                    total=1,
+                    completed=0,
+                    skipped=len(skipped),
+                    failed=len(failed),
+                    current="",
+                )
             prompt = relation_prompt(relation_entries)
             say("\n--- relations prompt ---")
             say(prompt[:1000] + ("..." if len(prompt) > 1000 else ""))
@@ -1791,6 +1930,17 @@ def main() -> None:
         f"output_tokens={USAGE['output']} total_tokens={USAGE['input'] + USAGE['output']}"
     )
     if args.write:
+        if progress_enabled:
+            write_progress(
+                progress_path,
+                state="running",
+                phase="writing",
+                total=progress_total,
+                completed=progress_total,
+                skipped=len(skipped),
+                failed=len(failed),
+                current="",
+            )
         payload["version"] = 3
         payload["title"] = payload.get("title") or project.name
         payload["updatedAt"] = now_iso()
@@ -1799,6 +1949,17 @@ def main() -> None:
         write_graph_file(graph_path, text, payload)
         say(f"wrote {graph_path}")
         say(f"sessions updated: {len(touched)}, skipped: {len(skipped)}")
+        if progress_enabled:
+            write_progress(
+                progress_path,
+                state="failed" if failed else "done",
+                phase="done",
+                total=progress_total,
+                completed=progress_total,
+                skipped=len(skipped),
+                failed=len(failed),
+                current="",
+            )
         if failed:
             # Keep any partial results on disk, but make the failure loud: the
             # Host turns a non-zero exit into an error result, so the panel shows
