@@ -255,6 +255,12 @@ assert.equal(cards.length, 3, "archived and subagent rows must be filtered out, 
 const cardTitle = (card) => findOne(card, (node) => node.props?.className === "dsm-card-title")?.children?.[0];
 const names = cards.map(cardTitle).sort();
 assert.deepEqual(names, ["Alpha", "Beta", "Fork"]);
+for (const card of cards) {
+  assert.ok(["running", "active", "archived"].includes(card.props["data-status"]),
+    "cards expose their status so the stylesheet can pick a theme-aware tint");
+  assert.equal(card.props.style, undefined,
+    "cards must not carry inline light-mode colors; the tint comes from theme tokens");
+}
 
 const toolbar = findOne(page, (node) => node.props?.className === "dsm-toolbar");
 assert.ok(toolbar, "the toolbar is rendered");
@@ -271,6 +277,12 @@ const viewSwitch = findOne(page, (node) => node.props?.className === "dsm-seg");
 const viewLabels = findAll(viewSwitch, (node) => node.type === "button").map((button) => button.children?.[0]);
 assert.deepEqual(viewLabels, ["会话", "PR"], "the cards view is labelled Sessions");
 assert.ok(!client.__test.CSS.includes("dsm-graph"), "graph styles are removed with the graph view");
+assert.ok(client.__test.CSS.includes("body[data-ds-dark-theme]"),
+  "the stylesheet has a dark-theme branch for colors that have no DSH alias token");
+assert.ok(client.__test.CSS.includes('.dsm-card[data-status="running"]'),
+  "card tints are keyed by status instead of inline light-only values");
+assert.ok(client.__test.CSS.includes("--dsw-alias-state-business-primary"),
+  "accent surfaces resolve from DSH theme tokens");
 assert.ok(!findOne(page, (node) => node.props?.className === "dsm-cards-head"), "the cards header no longer takes a row");
 const statusRow = findOne(page, (node) => typeof node.props?.className === "string" &&
   node.props.className.split(" ").includes("dsm-summary-status"));

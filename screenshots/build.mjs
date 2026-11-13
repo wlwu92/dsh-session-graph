@@ -48,7 +48,7 @@ function renderCard(item) {
     ? ""
     : `<div class="dsm-card-prs">${item.prs.map((pr) =>
         `<a class="dsm-pr-chip ${esc(pr.state)}" href="#">#${pr.number}</a>`).join("")}</div>`;
-  return `<article class="dsm-card${item.current ? " is-current" : ""}${item.status === "archived" ? " is-archived" : ""}" style="--dsm-accent:#4c6ef5;--dsm-bg:#fafbff">
+  return `<article class="dsm-card${item.current ? " is-current" : ""}${item.status === "archived" ? " is-archived" : ""}" data-status="${esc(item.status)}">
     <div class="dsm-card-head">
       <span class="dsm-dot ${item.status}"></span>
       <h3 class="dsm-card-title">${esc(displayTitle)}</h3>

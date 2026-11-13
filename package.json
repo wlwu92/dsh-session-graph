@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-graph",
-  "version": "0.7.9",
+  "version": "0.7.10",
   "description": "DSH Web plugin: a project session map with mainline dimensions, tags and PR links, plus /summarize-* commands that write DSH_SESSION_GRAPH.md.",
   "repository": {
     "type": "git",
