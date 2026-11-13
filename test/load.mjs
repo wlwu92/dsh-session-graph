@@ -264,6 +264,11 @@ const viewSwitch = findOne(page, (node) => node.props?.className === "dsm-seg");
 const viewLabels = findAll(viewSwitch, (node) => node.type === "button").map((button) => button.children?.[0]);
 assert.deepEqual(viewLabels, ["卡片", "PR"], "the knowledge graph view is gone");
 assert.ok(!client.__test.CSS.includes("dsm-graph"), "graph styles are removed with the graph view");
+assert.ok(!findOne(page, (node) => node.props?.className === "dsm-cards-head"), "the cards header no longer takes a row");
+const statusRow = findOne(page, (node) => typeof node.props?.className === "string" &&
+  node.props.className.split(" ").includes("dsm-summary-status"));
+assert.ok(statusRow, "the command status row is always mounted");
+assert.ok(statusRow.props.className.split(" ").includes("is-empty"), "an idle status row is hidden but still reserves height");
 
 const alpha = cards.find((card) => cardTitle(card) === "Alpha");
 alpha.props.onClick();

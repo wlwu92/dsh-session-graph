@@ -84,8 +84,6 @@
     ],
     "generate": "生成维度"
   },
-  "cardsHead": "8 个会话",
-  "currentDimension": "当前主线：认证与权限",
   "cards": [
     {
       "title": "登录鉴权：接入 OAuth 回调",

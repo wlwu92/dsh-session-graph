@@ -136,13 +136,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica
     <label class="dsm-toggle"><input type="checkbox">${esc(data.showArchived)}</label>
     <div class="dsm-legend">${legend}</div>
   </div>
+  <div class="dsm-summary-status is-empty"></div>
   <div class="dsm-body">
     ${renderFacets(data.facets)}
     <section class="dsm-cards">
-      <div class="dsm-cards-head">
-        <span>${esc(data.cardsHead)}</span>
-        <span class="dsm-filter-note">${esc(data.currentDimension)}</span>
-      </div>
       <div class="dsm-card-grid">${cards}</div>
     </section>
   </div>
