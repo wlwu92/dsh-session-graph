@@ -46,7 +46,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node test/load.mjs && node test/host.mjs",
+    "test": "node test/load.mjs && node test/host.mjs && python3 test/summarize_sessions_test.py",
     "screenshots": "node screenshots/build.mjs && node screenshots/graph.mjs"
   },
   "dsh": {

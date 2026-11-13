@@ -4,29 +4,53 @@
 The graph has three layers:
 
 - project taxonomy: a handful of long-running dimensions, each with reusable tags;
-- project pull requests: fetched from GitHub with `gh`, used by the PR view;
+- project pull requests: the PR catalog, refreshed from GitHub in the background;
 - per-session entries: title, summary, dimension tags, related PRs and dependsOn.
 
 Dry-run by default: reads local data, prints the prompts, and makes no API calls
 or file writes. Pass --write to call the model and update the graph file.
 
-The model input is deliberately small: the session title, a few recent
-turnOutline entries (prompt + result), plus the PR numbers mentioned there. It
-does not send the whole context.
+Summary generation owns every card field, including PR association. There is no
+separate PR-linking pass: PR numbers are extracted from the evidence bundle that
+feeds the same summary call. The input is bounded and is never the whole session:
+
+- user messages verbatim (kept as long as the token budget allows);
+- the per-turn model summaries already stored in the projcache turnOutline;
+- the last one or two full assistant outputs;
+- PR evidence grepped out of the event log (PR URLs, `PR #123`, PR head branches)
+  reduced to short snippets.
+
+The assembled prompt is held under MAX_SUMMARY_TOKENS (20k); fixed instructions
+and taxonomy are counted before the variable sections are packed.
+
+Summaries are incremental. An entry stores the last summarized content seq, the
+last summarized turn seq, whether that turn was still running, and the summary
+schema version (`summarizedSeq` / `summarizedTurnSeq` / `summarizedTurnOpen` /
+`summarizedVersion`). A changed session is re-summarized from the previous
+summary plus only the newer turns. Pass --force to redo an up-to-date session
+from a full rebuild.
+
+GitHub is a background concern: summarization never calls `gh`. The catalog is
+refreshed by `--mode prs` (also used by `/summarize-prs`) and by a detached
+refresh spawned after a summary run, throttled by `prUpdatedAt`.
 
 Archived sessions are frozen: they are skipped by default (even with --all and
 even when the graph file already lists them). Pass --include-archived to
 summarize them anyway.
 
-Summaries are incremental: an entry records the session seq and taxonomy stamp
-it was written from (`summarizedSeq` / `summarizedTaxonomy`), so a session that
-has not changed since its last summary costs no model call. Pass --force to
-redo up-to-date sessions anyway.
+The model route follows DSH's own default (deepseek-account / deepseek-flash on
+the Anthropic Messages API). Like DSH, it first uses the signed-in account token
+(`.credentials.yaml` record `deepseek-account-platform/default`, sent as
+`x-dsh-auth-token`) and falls back to `$DEEPSEEK_API_KEY` (`x-api-key`). Point it
+at a proxy with --base-url/--model/--api-key-env or the DSH_SUMMARY_BASE_URL /
+DSH_SUMMARY_MODEL / DSH_SUMMARY_API_KEY_ENV environment variables; --auth picks
+one credential explicitly. An authentication failure is reported (non-zero exit)
+instead of silently writing no entries.
 
-The model route follows DSH's own default (deepseek-official / deepseek-flash on
-the Anthropic Messages API). Point it at a proxy with --base-url/--model/
---api-key-env or the DSH_SUMMARY_BASE_URL / DSH_SUMMARY_MODEL /
-DSH_SUMMARY_API_KEY_ENV environment variables.
+A summary taken while the session's turn is still running is provisional: the
+entry records `summarizedTurnOpen`, and the next run re-summarizes it once the
+turn has ended. That matters most for a session with only one turn, whose turn
+seq never changes again.
 """
 
 from __future__ import annotations
@@ -50,10 +74,33 @@ DEFAULT_HOME = Path("~/.dsh").expanduser()
 DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic"
 DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_API_KEY_ENV = "DEEPSEEK_API_KEY"
-PR_LINK = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
-USAGE = {"calls": 0, "input": 0, "output": 0}
+# DSH stores its signed-in account token under this credentials record; the
+# `/anthropic` endpoint accepts it through the same header DSH uses.
+ACCOUNT_CREDENTIAL = "deepseek-account-platform/default"
+ACCOUNT_TOKEN_HEADER = "x-dsh-auth-token"
+USAGE = {"calls": 0, "input": 0, "output": 0, "auth_failed": False}
 DIMENSION_LIMIT = 10
 TAG_LIMIT = 12
+
+# Bump when the summary prompt/entry contract changes: entries written by an
+# older summarizer are rebuilt from the full session once. Version 3 adds
+# `summarizedTurnOpen`, so a provisional mid-turn summary is refreshed after the
+# turn ends (single-turn sessions otherwise never change their turn seq).
+SUMMARY_VERSION = 3
+MAX_SUMMARY_TOKENS = 20_000
+PR_EVIDENCE_LIMIT = 12
+RECENT_OUTPUT_CHARS = 2_000
+USER_MESSAGE_CHARS = 8_000
+PR_BACKGROUND_REFRESH_SECONDS = 10 * 60
+CONTENT_EVENT_TYPES = {"user/message", "assistant/message", "turn/end"}
+AUTH_ERROR_RE = re.compile(r"\bHTTP (?:401|403)\b|authentication", re.IGNORECASE)
+PR_URL_RE = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)", re.IGNORECASE)
+PR_WORD_RE = re.compile(r"(?i)\b(?:PR|pull\s*request)\b[^\n#]{0,30}#?(\d{2,5})\b")
+
+
+def is_auth_error(error: object) -> bool:
+    """True when the model route rejected the credential rather than the request."""
+    return bool(AUTH_ERROR_RE.search(str(error)))
 
 
 def read_events(log_path: Path) -> list[dict]:
@@ -65,7 +112,10 @@ def read_events(log_path: Path) -> list[dict]:
             text=True,
         ).stdout
     except FileNotFoundError:
-        print("zstd is required for the log fallback (brew install zstd)", file=sys.stderr)
+        print(
+            "zstd is not installed; summarizing from turnOutline only (no PR evidence)",
+            file=sys.stderr,
+        )
         return []
     except subprocess.CalledProcessError as exc:
         print(f"skip {log_path}: {exc.stderr.strip()}", file=sys.stderr)
@@ -82,23 +132,69 @@ def read_events(log_path: Path) -> list[dict]:
     return events
 
 
+def _join_blocks(blocks: object) -> str:
+    if not isinstance(blocks, list):
+        return ""
+    return "\n".join(
+        str(block.get("text") or "")
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "text"
+    ).strip()
+
+
+def event_text(event: dict) -> str:
+    """Return the human-visible text of one event (no reasoning blocks)."""
+    kind = event.get("type")
+    data = event.get("data") or {}
+    if not isinstance(data, dict):
+        return ""
+    if kind == "user/message":
+        return _join_blocks(data.get("content"))
+    if kind == "assistant/message":
+        message = data.get("message") or {}
+        return _join_blocks(message.get("content") if isinstance(message, dict) else None)
+    if kind == "tool/result":
+        message = data.get("message") or {}
+        return _join_blocks(message.get("content") if isinstance(message, dict) else None)
+    if kind == "command/done":
+        return str(data.get("text") or "").strip()
+    return ""
+
+
+def event_kind(event: dict) -> str:
+    kind = str(event.get("type") or "")
+    if kind == "assistant/message":
+        return "assistant"
+    if kind == "user/message":
+        data = event.get("data")
+        source = data.get("source") if isinstance(data, dict) else None
+        if not isinstance(source, dict):
+            source = {}
+        return "user" if source.get("kind") == "user" else "other"
+    if kind == "tool/result":
+        return "tool"
+    return "other"
+
+
 def human_messages(events: list[dict], limit: int) -> list[str]:
     messages: list[str] = []
     for event in events:
-        if event.get("type") != "user/message":
+        if event_kind(event) != "user":
             continue
-        data = event.get("data") or {}
-        source = data.get("source") or {}
-        if source.get("kind") != "user":
-            continue
-        text = "\n".join(
-            block.get("text", "")
-            for block in data.get("content") or []
-            if block.get("type") == "text"
-        ).strip()
+        text = event_text(event)
         if text:
             messages.append(text[:2000])
     return messages[-limit:]
+
+
+def content_seq_of(events: list[dict], fallback: int = 0) -> int:
+    """Highest seq of an event that changes what a summary should say."""
+    seqs = [
+        int(event.get("seq") or 0)
+        for event in events
+        if event.get("type") in CONTENT_EVENT_TYPES
+    ]
+    return max(seqs, default=fallback)
 
 
 def find_log(home: Path, session_id: str) -> Path | None:
@@ -130,12 +226,9 @@ def load_sessions(home: Path) -> dict[str, dict]:
         title = (rows.get("title") or {}).get("val") or ""
         first = (((rows.get("titleInput") or {}).get("val") or {}).get("first") or {}).get("text", "")
         outline = (rows.get("turnOutline") or {}).get("val") or {}
-        # Every row carries the event seq it was last written at; the maximum is
-        # the session's persisted position and changes on any new activity.
-        # A `session/title` event is not new content: the panel writes summary
-        # titles back to the Session after a run, and counting that event would
-        # invalidate the bookmark and make the next run re-summarize (and bill)
-        # every renamed Session.
+        # Every row carries the event seq it was last written at. Command and
+        # summary-title events bump every row, so the row seq is not a stable
+        # content marker; it is kept for diagnostics only.
         seq = max(
             (
                 row.get("seq") or 0
@@ -144,26 +237,64 @@ def load_sessions(home: Path) -> dict[str, dict]:
             ),
             default=0,
         )
+        turns = outline.get("turns") or []
+        # The last turn seq is the freshness bookmark: it only moves when the
+        # user starts a new turn, not when the summarizer writes a title back.
+        turn_seq = max(
+            (
+                int(turn.get("seq") or 0)
+                for turn in turns
+                if isinstance(turn, dict)
+            ),
+            default=0,
+        )
+        # `turnSeq` is the turn *start* and never moves when that turn finishes.
+        # Track whether a turn is still running so a summary written mid-turn can
+        # be refreshed once the final answer exists (the only refresh point a
+        # single-turn session will ever get).
+        boundary = (rows.get("turnBoundary") or {}).get("val")
+        if isinstance(boundary, dict) and "openTurnStartSeq" in boundary:
+            turn_open = boundary.get("openTurnStartSeq") is not None
+        else:
+            stats = (rows.get("sessionStats") or {}).get("val")
+            turn_open = isinstance(stats, dict) and stats.get("openStep") is not None
         sessions[sid] = {
             "id": sid,
             "cwd": cwd,
             "title": title or (first.splitlines()[0][:80] if first.splitlines() else ""),
             "created": identity.get("createdAt", 0),
             "seq": int(seq),
-            "turns": outline.get("turns") or [],
+            "turnSeq": turn_seq,
+            "turnOpen": bool(turn_open),
+            "turns": turns,
         }
     return sessions
 
 
 def summary_is_current(entry: dict | None, session: dict, taxonomy_updated: str) -> bool:
-    """True when `entry` was summarized from this exact session state and taxonomy."""
+    """True when `entry` was summarized from this exact session state and taxonomy.
+
+    Entries from an older summary schema are always rebuilt once. For current
+    entries the cheap check uses the last turn seq; a missing turn bookmark falls
+    back to the content bookmark and is backfilled on the next write. A summary
+    taken while the turn was still running is provisional by definition, so it is
+    never considered current: the next run refreshes it from the finished turn.
+    """
     if not isinstance(entry, dict):
         return False
     if str(entry.get("summary") or "").strip() == "":
         return False
     if entry.get("summarizedTaxonomy") != taxonomy_updated:
         return False
-    return entry.get("summarizedSeq") == session.get("seq")
+    if entry.get("summarizedVersion") != SUMMARY_VERSION:
+        return False
+    if entry.get("summarizedTurnOpen") is True:
+        return False
+    turn_seq = int(session.get("turnSeq") or 0)
+    stored_turn = entry.get("summarizedTurnSeq")
+    if stored_turn is not None:
+        return int(stored_turn) == turn_seq
+    return int(entry.get("summarizedSeq") or 0) >= turn_seq
 
 
 def in_project(cwd: str, project: Path) -> bool:
@@ -235,9 +366,10 @@ def detect_repo(project: Path) -> str:
     return "/".join(parts[:2]) if len(parts) >= 2 else ""
 
 
-def gh_pr_catalog(repo: str, limit: int = 300) -> list[dict]:
+def gh_pr_catalog(repo: str, limit: int = 300) -> list[dict] | None:
+    """Return the catalog, or None when GitHub could not be queried."""
     if repo == "":
-        return []
+        return None
     fields = (
         "number,title,state,url,headRefName,author,mergedAt,updatedAt,isDraft,closedAt"
     )
@@ -262,16 +394,16 @@ def gh_pr_catalog(repo: str, limit: int = 300) -> list[dict]:
             timeout=90,
         )
     except FileNotFoundError:
-        print("gh is not installed; PR catalog will only use links found in sessions", file=sys.stderr)
-        return []
+        print("gh is not installed; keeping the existing PR catalog", file=sys.stderr)
+        return None
     except subprocess.SubprocessError as exc:
         print(f"gh pr list failed: {exc}", file=sys.stderr)
-        return []
+        return None
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         print(f"gh pr list returned invalid JSON: {exc}", file=sys.stderr)
-        return []
+        return None
     catalog = []
     for item in data:
         if not isinstance(item, dict):
@@ -326,40 +458,167 @@ def compact_turns(turns: list[dict], prompt_chars: int, result_chars: int) -> li
     return compact
 
 
-def pr_refs(turns: list[dict], repo: str) -> list[dict]:
-    refs: dict[int, dict] = {}
-    for turn in turns:
-        text = f"{turn.get('prompt', '')}\n{turn.get('result', '') or turn.get('response', '')}"
-        for match in PR_LINK.finditer(text):
-            found_repo = match.group(1)
-            if repo and found_repo.lower() != repo.lower():
-                continue
-            number = int(match.group(2))
-            refs.setdefault(number, {"number": number, "url": match.group(0)})
-    return list(refs.values())
+def estimate_tokens(text: str) -> int:
+    """Cheap mixed Chinese/English estimate used to enforce the input budget."""
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return int(cjk + (len(text) - cjk) / 3.5 + 0.5)
 
 
-def merge_pr_refs(catalog: list[dict], refs: list[dict]) -> list[dict]:
-    known = {pr.get("number") for pr in catalog}
-    merged = list(catalog)
-    for ref in refs:
-        if ref["number"] in known:
+def snippet_around(text: str, start: int, end: int, radius: int = 140) -> str:
+    left = max(0, start - radius)
+    right = min(len(text), end + radius)
+    body = re.sub(r"\s+", " ", text[left:right]).strip()
+    prefix = "…" if left > 0 else ""
+    suffix = "…" if right < len(text) else ""
+    return (prefix + body + suffix)[:320]
+
+
+def grep_pr_evidence(
+    events: list[dict],
+    repo: str,
+    catalog: list[dict],
+    start_seq: int = 0,
+    limit: int = PR_EVIDENCE_LIMIT,
+) -> list[dict]:
+    """Grep a session log for PR evidence and return compact, deduped snippets.
+
+    This is the only PR extraction in the pipeline. It runs as part of building
+    the summary input, so the summary call sees both the snippets and the
+    authoritative numbers; there is no later linking pass.
+    """
+    catalog_numbers = {
+        int(pr["number"])
+        for pr in catalog
+        if isinstance(pr, dict) and isinstance(pr.get("number"), int)
+    }
+    branches: list[tuple[str, int]] = []
+    for pr in catalog:
+        if not isinstance(pr, dict):
             continue
-        known.add(ref["number"])
-        merged.append(
-            {
-                "number": ref["number"],
-                "title": "",
-                "url": ref["url"],
-                "state": "UNKNOWN",
-                "author": "",
-                "headRefName": "",
-                "updatedAt": "",
-                "isDraft": False,
-            }
-        )
-    merged.sort(key=lambda pr: pr["number"], reverse=True)
-    return merged
+        branch = str(pr.get("headRefName") or "")
+        number = pr.get("number")
+        if isinstance(number, int) and len(branch) >= 8:
+            branches.append((branch, number))
+    branch_re = None
+    branch_numbers: dict[str, int] = {}
+    if branches:
+        branches.sort(key=lambda item: len(item[0]), reverse=True)
+        branch_re = re.compile("|".join(re.escape(branch) for branch, _ in branches))
+        branch_numbers = dict(branches)
+    rank = {"assistant": 3, "user": 2, "tool": 1}
+    best: dict[int, dict] = {}
+
+    def add(number: int, url: str, source: str, seq: int, snippet: str) -> None:
+        if number <= 0:
+            return
+        item = {
+            "number": number,
+            "url": url,
+            "source": source,
+            "seq": seq,
+            "snippet": snippet,
+            "rank": rank.get(source, 0),
+        }
+        old = best.get(number)
+        if old is None or item["rank"] > old["rank"] or (
+            item["rank"] == old["rank"] and item["seq"] >= old["seq"]
+        ):
+            if old is not None and old.get("url") and url == "":
+                item["url"] = old["url"]
+            best[number] = item
+
+    for event in events:
+        seq = int(event.get("seq") or 0)
+        if seq <= start_seq:
+            continue
+        source = event_kind(event)
+        if source not in rank:
+            continue
+        text = event_text(event)
+        if text == "":
+            continue
+        url_matches = list(PR_URL_RE.finditer(text))
+        # `gh pr list` dumps hundreds of URLs into one tool result; it is a
+        # catalog listing, not evidence that this session worked on those PRs.
+        bulk_tool = source == "tool" and len(url_matches) > 4
+        if not bulk_tool:
+            for match in url_matches:
+                found_repo = match.group(1)
+                if repo and found_repo.lower() != repo.lower():
+                    continue
+                add(
+                    int(match.group(2)),
+                    match.group(0),
+                    source,
+                    seq,
+                    snippet_around(text, match.start(), match.end()),
+                )
+            for match in PR_WORD_RE.finditer(text):
+                number = int(match.group(1))
+                if number in catalog_numbers:
+                    add(
+                        number,
+                        "",
+                        source,
+                        seq,
+                        snippet_around(text, match.start(), match.end()),
+                    )
+        if branch_re is not None and source in ("assistant", "user"):
+            for match in branch_re.finditer(text):
+                number = branch_numbers.get(match.group(0))
+                if number is not None:
+                    add(
+                        number,
+                        "",
+                        source,
+                        seq,
+                        snippet_around(text, match.start(), match.end()),
+                    )
+    items = sorted(
+        best.values(),
+        key=lambda item: (item["rank"], item["seq"]),
+        reverse=True,
+    )
+    return items[:limit]
+
+
+def ensure_catalog_entries(
+    payload: dict,
+    numbers: list[int],
+    repo: str,
+    evidence: list[dict],
+) -> None:
+    """Make sure every linked PR can render, without calling GitHub."""
+    catalog = payload.get("pullRequests")
+    if not isinstance(catalog, list):
+        catalog = []
+    by_number = {
+        pr.get("number"): pr for pr in catalog if isinstance(pr, dict)
+    }
+    urls = {
+        int(item["number"]): item.get("url", "")
+        for item in evidence
+        if isinstance(item.get("number"), int)
+    }
+    for number in numbers:
+        if number in by_number:
+            continue
+        pr = {
+            "number": number,
+            "title": "",
+            "url": urls.get(number)
+            or (f"https://github.com/{repo}/pull/{number}" if repo else ""),
+            "state": "UNKNOWN",
+            "author": "",
+            "headRefName": "",
+            "updatedAt": "",
+            "isDraft": False,
+        }
+        catalog.append(pr)
+        by_number[number] = pr
+    catalog = [pr for pr in catalog if isinstance(pr, dict)]
+    catalog.sort(key=lambda pr: int(pr.get("number") or 0), reverse=True)
+    payload["pullRequests"] = catalog
 
 
 def compact_taxonomy(taxonomy: dict | None) -> list[dict]:
@@ -418,35 +677,178 @@ def taxonomy_prompt(
     )
 
 
-def session_prompt(
+def clip_text(text: str, limit: int) -> str:
+    text = str(text or "").strip()
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head - 5
+    return f"{text[:head].rstrip()}\n…\n{text[-tail:].lstrip()}"
+
+
+def collect_summary_input(
     session: dict,
+    home: Path,
     entry: dict | None,
-    turns: list[dict],
-    pr_candidates: list[dict],
-    taxonomy: dict | None,
-) -> str:
+    repo: str,
+    catalog: list[dict],
+    full: bool,
+) -> dict:
+    """Build the bounded evidence bundle for one summary call.
+
+    `full` rebuilds from the whole session; otherwise only events newer than the
+    entry's `summarizedSeq` are packed, together with the previous summary.
+    """
+    turns = session.get("turns") or []
+    log = find_log(home, session["id"])
+    events = read_events(log) if log is not None else []
+    content_end = content_seq_of(events, fallback=int(session.get("turnSeq") or 0))
+    begin = 0 if full else max(0, int((entry or {}).get("summarizedSeq") or 0))
+
+    user_messages: list[dict] = []
+    assistant_outputs: list[dict] = []
+    for event in events:
+        seq = int(event.get("seq") or 0)
+        if seq <= begin:
+            continue
+        kind = event_kind(event)
+        if kind not in ("user", "assistant"):
+            continue
+        text = event_text(event)
+        if text == "":
+            continue
+        if kind == "user":
+            user_messages.append({"seq": seq, "text": clip_text(text, USER_MESSAGE_CHARS)})
+        else:
+            assistant_outputs.append({"seq": seq, "text": text})
+
+    turn_summaries: list[dict] = []
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        seq = int(turn.get("seq") or 0)
+        if seq <= begin:
+            continue
+        summary = str(turn.get("response") or turn.get("result") or "").strip()
+        if summary == "":
+            continue
+        turn_summaries.append({"turn": seq, "summary": clip_text(summary, 400)})
+
+    recent_outputs = [
+        {"seq": item["seq"], "text": clip_text(item["text"], RECENT_OUTPUT_CHARS)}
+        for item in assistant_outputs[-2:]
+    ]
+    evidence = grep_pr_evidence(events, repo, catalog, start_seq=begin)
+    previous = None
+    if isinstance(entry, dict) and (entry.get("summary") or entry.get("title")):
+        previous = {
+            "title": entry.get("title", ""),
+            "summary": entry.get("summary", ""),
+            "dimensions": entry.get("dimensions", {}),
+            "pullRequests": entry.get("pullRequests", []),
+        }
+    return {
+        "incremental": not full,
+        "startSeq": begin,
+        "contentSeq": max(content_end, begin),
+        "turnSeq": int(session.get("turnSeq") or 0),
+        "userMessages": user_messages,
+        "turnSummaries": turn_summaries,
+        "recentOutputs": recent_outputs,
+        "prEvidence": evidence,
+        "previousSummary": previous,
+        "turnCount": len(turns),
+    }
+
+
+SUMMARY_RULES = (
+    "Label one DSH coding session for a project map. Write the title and summary in Chinese. "
+    "The title must name the concrete function or change, not a vague activity; prefer "
+    "'模块/对象：动作/结果' and keep it within 30 characters. The summary explains what was "
+    "delivered and its scope in at most 120 characters. Base everything on the supplied "
+    "evidence; do not invent facts.\n\n"
+    "When previousSummary is present this is an incremental update: keep its facts, merge only "
+    "the new userMessages/turnSummaries/recentOutputs, and rewrite the summary as the current "
+    "state rather than appending a changelog.\n\n"
+    "PR association is part of this summary. prEvidence contains grep hits from the session "
+    "log (PR URLs, `PR #123`, PR head branches); choose prs only from its numbers and return "
+    "[] when it is empty. Never invent a number.\n\n"
+    "Assign dimension tags from the supplied taxonomy: choose 1-3 dimensions and 1-5 tags per "
+    "chosen dimension. Use only ids that appear in the taxonomy. Omit a dimension when it does "
+    "not apply.\n\n"
+    "Return only JSON of this shape:\n"
+    '{"title":"...","summary":"...","dimensions":{"<dimension-id>":["<tag-id>"]},'
+    '"prs":[123]}\n'
+    "Return JSON only, no Markdown.\n\n"
+)
+
+
+def summary_prompt(bundle: dict, taxonomy: dict | None, catalog: list[dict]) -> str:
+    by_number = {
+        int(pr["number"]): pr
+        for pr in catalog
+        if isinstance(pr, dict) and isinstance(pr.get("number"), int)
+    }
     payload = {
-        "title": entry.get("title") if isinstance(entry, dict) else session.get("title", ""),
-        "existingSummary": entry.get("summary", "") if isinstance(entry, dict) else "",
-        "recentTurns": turns,
-        "pullRequestCandidates": pr_candidates,
+        "incremental": bundle["incremental"],
+        "previousSummary": bundle["previousSummary"],
+        "userMessages": bundle["userMessages"],
+        "turnSummaries": bundle["turnSummaries"],
+        "recentOutputs": bundle["recentOutputs"],
+        "prEvidence": [
+            {
+                "number": item["number"],
+                "title": by_number.get(item["number"], {}).get("title", ""),
+                "state": by_number.get(item["number"], {}).get("state", "UNKNOWN"),
+                "url": item.get("url", ""),
+                "source": item.get("source", ""),
+                "snippet": item.get("snippet", ""),
+            }
+            for item in bundle["prEvidence"]
+        ],
         "taxonomy": compact_taxonomy(taxonomy),
     }
-    return (
-        "Label one DSH coding session for a project map. Write the title and summary in Chinese. "
-        "The title must name the concrete function or change, not a vague activity; prefer "
-        "'模块/对象：动作/结果' and keep it within 30 characters. The summary explains what was "
-        "delivered and its scope in at most 120 characters. Base everything on the supplied turns, "
-        "existing values and PR candidates; do not invent facts.\n\n"
-        "Also assign dimension tags from the supplied taxonomy: choose 1-3 dimensions and 1-5 "
-        "tags per chosen dimension. Use only ids that appear in the taxonomy. Omit a dimension "
-        "when it does not apply. Keep only PR numbers from pullRequestCandidates.\n\n"
-        "Return only JSON of this shape:\n"
-        '{"title":"...","summary":"...","dimensions":{"<dimension-id>":["<tag-id>"]},'
-        '"prs":[123]}\n'
-        "Return JSON only, no Markdown.\n\n"
-        + json.dumps(payload, ensure_ascii=False)
-    )
+    return SUMMARY_RULES + json.dumps(payload, ensure_ascii=False)
+
+
+def shrink_summary_input(bundle: dict) -> bool:
+    """Drop the least useful section until the caller's token budget fits."""
+    for key in ("turnSummaries", "recentOutputs", "userMessages"):
+        items = bundle.get(key) or []
+        if len(items) > 1:
+            items.pop(0)
+            return True
+    evidence = bundle.get("prEvidence") or []
+    if len(evidence) > 1:
+        evidence.pop()
+        return True
+    for key, field in (
+        ("turnSummaries", "summary"),
+        ("recentOutputs", "text"),
+        ("userMessages", "text"),
+        ("prEvidence", "snippet"),
+    ):
+        items = bundle.get(key) or []
+        if not items:
+            continue
+        value = str(items[0].get(field) or "")
+        if len(value) > 240:
+            items[0][field] = value[: max(240, len(value) // 2)]
+            return True
+    return False
+
+
+def pack_summary_input(
+    bundle: dict,
+    taxonomy: dict | None,
+    catalog: list[dict],
+) -> tuple[str, int]:
+    prompt = summary_prompt(bundle, taxonomy, catalog)
+    tokens = estimate_tokens(prompt)
+    while tokens > MAX_SUMMARY_TOKENS and shrink_summary_input(bundle):
+        prompt = summary_prompt(bundle, taxonomy, catalog)
+        tokens = estimate_tokens(prompt)
+    return prompt, tokens
 
 
 def relation_prompt(entries: list[dict]) -> str:
@@ -689,98 +1091,6 @@ def reaches(
     return any(reaches(graph, nxt, goal, visited) for nxt in graph.get(start, []))
 
 
-def add_number(numbers: list[int], number: int) -> None:
-    if number not in numbers:
-        numbers.append(number)
-
-
-def link_session_pull_requests(
-    payload: dict,
-    sessions: dict[str, dict],
-    home: Path,
-    limit: int,
-    repo: str,
-) -> None:
-    """Union session PR links from turns and summaries into the graph.
-
-    This is deterministic and free; it also backfills archived entries that are
-    intentionally not re-summarized.
-    """
-    catalog = payload.get("pullRequests") if isinstance(payload.get("pullRequests"), list) else []
-    by_number = {
-        pr["number"]: pr
-        for pr in catalog
-        if isinstance(pr, dict) and isinstance(pr.get("number"), int)
-    }
-    for entry in payload.get("sessions") or []:
-        if not isinstance(entry, dict):
-            continue
-        session_id = entry.get("session")
-        if not isinstance(session_id, str) or session_id == "":
-            continue
-        numbers: list[int] = []
-        for value in entry.get("pullRequests") or []:
-            try:
-                add_number(numbers, int(value))
-            except (TypeError, ValueError):
-                continue
-        session = sessions.get(session_id)
-        all_text = ""
-        if session is not None:
-            all_turns = session.get("turns") or session_turns(session, home, limit)
-            for ref in pr_refs(all_turns, repo):
-                add_number(numbers, ref["number"])
-            all_text = "\n".join(
-                f"{turn.get('prompt', '')}\n{turn.get('result', '') or turn.get('response', '')}"
-                for turn in all_turns
-            )
-        # A session often mentions the branch it created; the PR catalog knows
-        # the head branch, so this links PRs that never appear as a URL.
-        for pr in catalog:
-            if not isinstance(pr, dict):
-                continue
-            branch = pr.get("headRefName") or ""
-            number = pr.get("number")
-            if isinstance(number, int) and isinstance(branch, str) and len(branch) >= 6 and branch in all_text:
-                add_number(numbers, number)
-        # The model output often writes "PR 提交：**#606**" instead of a URL.
-        # Accept any #number shortly after the word PR.
-        for match in re.finditer(r"(?i)\bPR\b[^\n#]{0,40}#(\d+)", all_text):
-            add_number(numbers, int(match.group(1)))
-        # "PR 604" without a # is only accepted when 604 is a known PR.
-        for match in re.finditer(r"(?i)\bPR\b[^\n#]{0,20}?(\d{2,4})\b", all_text):
-            number = int(match.group(1))
-            if number in by_number:
-                add_number(numbers, number)
-        text = f"{entry.get('title', '')}\n{entry.get('summary', '')}"
-        for match in re.finditer(r"(?i)\bPR\b[^\n#]{0,40}#(\d+)", text):
-            add_number(numbers, int(match.group(1)))
-        for match in re.finditer(r"(?i)\bPR\b[^\n#]{0,20}?(\d{2,4})\b", text):
-            number = int(match.group(1))
-            if number in by_number:
-                add_number(numbers, number)
-        for match in re.finditer(r"github\.com/[\w.-]+/[\w.-]+/pull/(\d+)", text):
-            add_number(numbers, int(match.group(1)))
-        entry["pullRequests"] = numbers[:4]
-        for number in numbers[:4]:
-            if number in by_number:
-                continue
-            by_number[number] = {
-                "number": number,
-                "title": "",
-                "url": f"https://github.com/{repo}/pull/{number}" if repo else "",
-                "state": "UNKNOWN",
-                "author": "",
-                "headRefName": "",
-                "updatedAt": "",
-                "isDraft": False,
-            }
-            catalog.append(by_number[number])
-    catalog = [pr for pr in catalog if isinstance(pr, dict)]
-    catalog.sort(key=lambda pr: pr.get("number", 0), reverse=True)
-    payload["pullRequests"] = catalog
-
-
 def credential_from_file(home: Path, name: str) -> str:
     """Read one ref from the same .credentials.yaml the Host uses."""
     path = home / ".credentials.yaml"
@@ -790,27 +1100,84 @@ def credential_from_file(home: Path, name: str) -> str:
     match = re.search(rf"^\s*{re.escape(name)}\s*:\s*(.+?)\s*$", text, re.MULTILINE)
     if match is None:
         return ""
-    value = match.group(1).strip()
+    return _unquote(match.group(1))
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         value = value[1:-1]
     return value
 
 
+def account_token_from_file(home: Path) -> str:
+    """Read DSH's signed-in account token (`deepseek-account-platform/default`).
+
+    DSH sends this token as `x-dsh-auth-token`; reusing it keeps the summarizer on
+    the same route as the running Harness (the default `deepseek-account`
+    provider) instead of depending on a separately minted platform API key.
+    """
+    path = home / ".credentials.yaml"
+    if not path.exists():
+        return ""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return ""
+    in_record = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= 2:
+            # Record keys sit at two spaces under `records:`.
+            key = stripped.split(":", 1)[0].strip()
+            in_record = indent == 2 and key == ACCOUNT_CREDENTIAL
+            continue
+        if in_record and stripped.startswith("token:"):
+            return _unquote(stripped.split(":", 1)[1])
+    return ""
+
+
+def resolve_credentials(
+    auth: str,
+    *,
+    base_url: str,
+    account_token: str,
+    api_key: str,
+    api_key_source: str,
+) -> list[tuple[str, str, str]]:
+    """Ordered credential candidates as `(auth mode, secret, human-readable source)`."""
+    account = [("account", account_token, "DSH account token")] if account_token else []
+    api = [("api-key", api_key, api_key_source)] if api_key else []
+    if auth == "account":
+        return account
+    if auth == "api-key":
+        return api
+    # The public endpoint speaks both schemes, so prefer the route DSH itself
+    # uses. A custom proxy is more likely to have been set up for x-api-key.
+    if base_url.rstrip("/") == DEFAULT_BASE_URL.rstrip("/"):
+        return account + api
+    return api + account
+
+
 def call_llm(
     base: str,
     model: str,
-    api_key: str,
+    credential: str,
     prompt: str,
     timeout: int,
     *,
     max_tokens: int = 1200,
     system: str = "You write short, factual session summaries for a task graph.",
     thinking_budget: int = 0,
+    auth: str = "api-key",
 ) -> str:
     url = base.rstrip("/") + "/v1/messages"
     headers = {
         "content-type": "application/json",
-        "x-api-key": api_key,
+        ACCOUNT_TOKEN_HEADER if auth == "account" else "x-api-key": credential,
         "anthropic-version": "2023-06-01",
     }
 
@@ -843,13 +1210,69 @@ def call_llm(
         data = send(False)
     usage = data.get("usage") or {}
     USAGE["calls"] += 1
-    USAGE["input"] += int(usage.get("input_tokens") or 0)
+    # Anthropic-compatible usage reports cached prompt tokens separately; count
+    # them so the printed input total matches the real prompt size.
+    USAGE["input"] += (
+        int(usage.get("input_tokens") or 0)
+        + int(usage.get("cache_creation_input_tokens") or 0)
+        + int(usage.get("cache_read_input_tokens") or 0)
+    )
     USAGE["output"] += int(usage.get("output_tokens") or 0)
     return "\n".join(
         block.get("text", "")
         for block in data.get("content") or []
         if block.get("type") == "text"
     ).strip()
+
+
+def call_model(
+    credentials: list[tuple[str, str, str]],
+    base_url: str,
+    model: str,
+    prompt: str,
+    timeout: int,
+    *,
+    max_tokens: int,
+    system: str,
+    thinking_budget: int = 0,
+) -> str | None:
+    """Call the model, falling back to the next credential on an auth rejection.
+
+    Non-auth failures do not consume the fallback: the credential is not the
+    problem. A final auth failure marks `USAGE["auth_failed"]` so the caller can
+    exit non-zero instead of reporting a successful no-op.
+    """
+    for index, (auth, credential, source) in enumerate(credentials):
+        try:
+            return call_llm(
+                base_url,
+                model,
+                credential,
+                prompt,
+                timeout,
+                max_tokens=max_tokens,
+                system=system,
+                thinking_budget=thinking_budget,
+                auth=auth,
+            )
+        except (urllib.error.URLError, TimeoutError, ValueError, RuntimeError) as exc:
+            more = index + 1 < len(credentials)
+            if is_auth_error(exc) and more:
+                print(
+                    f"  {source} was rejected; trying {credentials[index + 1][2]}",
+                    file=sys.stderr,
+                )
+                continue
+            print(f"  model call failed: {exc}", file=sys.stderr)
+            if is_auth_error(exc):
+                USAGE["auth_failed"] = True
+                print(
+                    "  hint: refresh the DSH account sign-in, or store a valid API "
+                    "key in the DSH .credentials.yaml",
+                    file=sys.stderr,
+                )
+            return None
+    return None
 
 
 def build_taxonomy_entries(
@@ -862,17 +1285,79 @@ def build_taxonomy_entries(
     for session in candidates:
         entry = existing.get(session["id"]) or {}
         turns = compact_turns(session_turns(session, home, limit), 500, 700)
-        refs = pr_refs(turns, "")
         entries.append(
             {
                 "id": session["id"],
                 "title": entry.get("title") or session.get("title", ""),
                 "summary": entry.get("summary", ""),
                 "recentTurns": turns[-2:],
-                "prs": [ref["number"] for ref in refs[:8]],
+                "prs": [
+                    number
+                    for number in (entry.get("pullRequests") or [])
+                    if isinstance(number, int)
+                ][:8],
             }
         )
     return entries
+
+
+def write_graph_file(graph_path: Path, text: str, payload: dict) -> None:
+    """Atomic write so a background PR refresh never observes a half file."""
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    body = replace_graph_json(text, payload)
+    tmp = graph_path.with_name(f".{graph_path.name}.tmp")
+    tmp.write_text(body)
+    os.replace(tmp, graph_path)
+
+
+def pr_catalog_is_stale(payload: dict, seconds: int = PR_BACKGROUND_REFRESH_SECONDS) -> bool:
+    stamp = str(payload.get("prUpdatedAt") or "")
+    if stamp == "":
+        return True
+    try:
+        updated = datetime.fromisoformat(stamp)
+    except ValueError:
+        return True
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - updated).total_seconds() >= seconds
+
+
+def schedule_background_pr_refresh(
+    project: Path,
+    graph_path: Path,
+    home: Path,
+    quiet: bool,
+) -> None:
+    """Fire one detached `--mode prs` run; summary commands never wait for gh."""
+    if os.environ.get("DSH_SESSION_GRAPH_BACKGROUND_PR", "1") == "0":
+        return
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--project",
+        str(project),
+        "--graph",
+        str(graph_path),
+        "--dsh-home",
+        str(home),
+        "--mode",
+        "prs",
+        "--write",
+        "--quiet",
+    ]
+    try:
+        subprocess.Popen(
+            command,
+            cwd=str(project),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        if not quiet:
+            print(f"  background PR refresh failed to start: {exc}", file=sys.stderr)
 
 
 def main() -> None:
@@ -885,14 +1370,14 @@ def main() -> None:
         default=Path(os.environ.get("DSH_HOME", DEFAULT_HOME)),
         help="DSH data root (default: $DSH_HOME, else ~/.dsh)",
     )
-    parser.add_argument("--limit", type=int, default=8, help="last N turns per session")
+    parser.add_argument("--limit", type=int, default=8, help="last N turns (taxonomy context)")
     parser.add_argument("--max-sessions", type=int, default=20)
     parser.add_argument("--session", default=None, help="summarize only this session id")
     parser.add_argument(
         "--mode",
         choices=["all", "taxonomy", "sessions", "prs"],
         default="all",
-        help="taxonomy: dimensions + PRs; sessions: summaries + tags; prs: PR catalog only",
+        help="taxonomy: dimensions + tags; sessions: summaries + tags; prs: PR catalog only",
     )
     parser.add_argument("--refresh-taxonomy", action="store_true")
     parser.add_argument("--relations", action="store_true", help="ask the model for dependency edges")
@@ -905,9 +1390,13 @@ def main() -> None:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="re-summarize sessions whose summary is already up to date",
+        help="redo an up-to-date session, rebuilding it from the full session",
     )
-    parser.add_argument("--no-prs", action="store_true", help="skip the gh PR catalog")
+    parser.add_argument(
+        "--no-prs",
+        action="store_true",
+        help="do not refresh the PR catalog (foreground or background)",
+    )
     parser.add_argument("--write", action="store_true", help="call the model and update the graph file")
     parser.add_argument(
         "--base-url",
@@ -921,8 +1410,16 @@ def main() -> None:
         "--api-key-env",
         default=os.environ.get("DSH_SUMMARY_API_KEY_ENV", DEFAULT_API_KEY_ENV),
     )
+    parser.add_argument(
+        "--auth",
+        choices=("auto", "account", "api-key"),
+        default=os.environ.get("DSH_SUMMARY_AUTH", "auto"),
+        help="model credential: DSH account token, API key, or try both (auto)",
+    )
     parser.add_argument("--timeout", type=int, default=90)
+    parser.add_argument("--quiet", action="store_true", help="suppress progress output")
     args = parser.parse_args()
+    say = (lambda *values, **kwargs: None) if args.quiet else print
 
     project = args.project.resolve()
     graph_path = args.graph or (project / "DSH_SESSION_GRAPH.md")
@@ -940,6 +1437,45 @@ def main() -> None:
         for item in payload.get("sessions") or []
         if isinstance(item, dict) and item.get("session")
     }
+    repo = str(payload.get("repo") or "").strip() or detect_repo(project)
+
+    if args.mode == "prs":
+        if not args.write:
+            say("dry-run: no GitHub call, no file writes; add --write to apply")
+            return
+        if args.no_prs:
+            say("PR refresh disabled (--no-prs)")
+            return
+        catalog = payload.get("pullRequests")
+        catalog = [pr for pr in catalog if isinstance(pr, dict)] if isinstance(catalog, list) else []
+        fresh = gh_pr_catalog(repo) if repo else None
+        refreshed = fresh is not None
+        if fresh is not None:
+            catalog = fresh
+        elif repo and not args.quiet:
+            print("PR catalog: gh unavailable; keeping existing entries", file=sys.stderr)
+        payload["pullRequests"] = catalog
+        referenced: list[int] = []
+        for entry in payload.get("sessions") or []:
+            if not isinstance(entry, dict):
+                continue
+            for value in entry.get("pullRequests") or []:
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if number not in referenced:
+                    referenced.append(number)
+        ensure_catalog_entries(payload, referenced, repo, [])
+        if repo:
+            payload["repo"] = repo
+        payload["version"] = 3
+        payload["title"] = payload.get("title") or project.name
+        if refreshed:
+            payload["prUpdatedAt"] = now_iso()
+        write_graph_file(graph_path, text, payload)
+        say(f"wrote {graph_path} ({len(payload['pullRequests'])} PRs)")
+        return
 
     candidates = []
     for session in sessions.values():
@@ -980,22 +1516,35 @@ def main() -> None:
         taxonomy_candidates.sort(key=lambda item: item.get("created") or 0, reverse=True)
         taxonomy_candidates = taxonomy_candidates[: max(args.max_sessions, 40)]
 
-    print(f"project: {project}")
-    print(f"graph:   {graph_path}")
-    print(f"sessions: {len(candidates)} (mode={args.mode}, write={args.write})")
+    say(f"project: {project}")
+    say(f"graph:   {graph_path}")
+    say(f"sessions: {len(candidates)} (mode={args.mode}, write={args.write})")
 
     api_key = credential_from_file(home, args.api_key_env)
-    key_source = "credentials file" if api_key else ""
+    key_source = f"{home / '.credentials.yaml'} refs.{args.api_key_env}" if api_key else ""
     if not api_key:
         api_key = os.environ.get(args.api_key_env, "")
-        key_source = "environment" if api_key else ""
-    if args.write and not api_key:
+        key_source = f"environment ${args.api_key_env}" if api_key else ""
+    account_token = account_token_from_file(home)
+    credentials = resolve_credentials(
+        args.auth,
+        base_url=args.base_url,
+        account_token=account_token,
+        api_key=api_key,
+        api_key_source=key_source,
+    )
+    if args.write and not credentials:
         raise SystemExit(
-            f"{args.api_key_env} is not configured in the environment or {home / '.credentials.yaml'}"
+            f"no model credential: sign in to DSH (account token) or set {args.api_key_env} "
+            f"in the environment or {home / '.credentials.yaml'} refs"
         )
-    print(f"model:   {args.model} via {args.base_url}")
-    if api_key:
-        print(f"api key: {args.api_key_env} from {key_source}")
+    say(f"model:   {args.model} via {args.base_url}")
+    if credentials:
+        primary = credentials[0][2]
+        if len(credentials) > 1:
+            fallbacks = ", ".join(source for _, _, source in credentials[1:])
+            primary += f" (fallback: {fallbacks})"
+        say(f"auth:    {primary}")
 
     def call(
         prompt: str,
@@ -1004,47 +1553,20 @@ def main() -> None:
         system: str,
         thinking_budget: int = 0,
     ) -> str | None:
-        try:
-            return call_llm(
-                args.base_url,
-                args.model,
-                api_key,
-                prompt,
-                args.timeout,
-                max_tokens=max_tokens,
-                system=system,
-                thinking_budget=thinking_budget,
-            )
-        except (urllib.error.URLError, TimeoutError, ValueError, RuntimeError) as exc:
-            print(f"  model call failed: {exc}", file=sys.stderr)
-            return None
+        return call_model(
+            credentials,
+            args.base_url,
+            args.model,
+            prompt,
+            args.timeout,
+            max_tokens=max_tokens,
+            system=system,
+            thinking_budget=thinking_budget,
+        )
 
-    repo = str(payload.get("repo") or "").strip() or detect_repo(project)
     catalog = payload.get("pullRequests") if isinstance(payload.get("pullRequests"), list) else []
     catalog = [pr for pr in catalog if isinstance(pr, dict) and pr.get("number") is not None]
-
-    refs_by_session: dict[str, list[dict]] = {}
-    for session in candidates:
-        refs_by_session[session["id"]] = pr_refs(session_turns(session, home, args.limit), repo)
-
-    refresh_prs = (
-        not args.no_prs
-        and args.session is None
-        and (args.mode in ("taxonomy", "prs", "all") or catalog == [])
-    )
-    if refresh_prs and repo != "":
-        fresh = gh_pr_catalog(repo)
-        if fresh:
-            catalog = fresh
-        else:
-            print("PR catalog: gh returned no rows; keeping existing entries", file=sys.stderr)
-    all_refs = [ref for refs in refs_by_session.values() for ref in refs]
-    catalog = merge_pr_refs(catalog, all_refs)
-    if args.write and repo != "":
-        payload["repo"] = repo
-        payload["pullRequests"] = catalog
-        payload["prUpdatedAt"] = now_iso()
-    print(f"pull requests: {len(catalog)} (repo={repo or 'unknown'})")
+    say(f"pull requests: {len(catalog)} (repo={repo or 'unknown'})")
 
     taxonomy: dict | None = (
         payload.get("taxonomy") if isinstance(payload.get("taxonomy"), dict) else None
@@ -1066,6 +1588,8 @@ def main() -> None:
             )
             if raw is None:
                 print("  taxonomy unchanged", file=sys.stderr)
+                if USAGE["auth_failed"]:
+                    raise SystemExit(1)
             else:
                 try:
                     taxonomy = normalize_taxonomy(parse_json_object(raw))
@@ -1086,21 +1610,6 @@ def main() -> None:
             )
             return
 
-    if args.mode == "prs":
-        print(
-            f"\nusage: calls={USAGE['calls']} input_tokens={USAGE['input']} "
-            f"output_tokens={USAGE['output']} total_tokens={USAGE['input'] + USAGE['output']}"
-        )
-        if args.write:
-            payload["version"] = 3
-            payload["title"] = payload.get("title") or project.name
-            payload["updatedAt"] = now_iso()
-            graph_path.write_text(replace_graph_json(text, payload))
-            print(f"wrote {graph_path}")
-        else:
-            print("dry-run: no API calls, no file writes; add --write to apply")
-        return
-
     if args.mode in ("sessions", "all") and taxonomy is None and args.write:
         print("\ntaxonomy is missing; generating it before session tagging", file=sys.stderr)
         entries = build_taxonomy_entries(taxonomy_candidates, existing, home, args.limit)
@@ -1111,6 +1620,8 @@ def main() -> None:
             system="You design compact taxonomies for coding sessions. Return JSON only.",
             thinking_budget=2048,
         )
+        if raw is None and USAGE["auth_failed"]:
+            raise SystemExit(1)
         if raw is not None:
             try:
                 taxonomy = normalize_taxonomy(parse_json_object(raw))
@@ -1123,37 +1634,40 @@ def main() -> None:
 
     touched: list[str] = []
     skipped: list[str] = []
+    failed: list[str] = []
     tag_sessions = args.mode in ("sessions", "all")
     taxonomy_updated = str((payload.get("taxonomy") or {}).get("updatedAt") or "")
     for session in (candidates if tag_sessions else []):
+        if USAGE["auth_failed"]:
+            break
         entry = existing.get(session["id"])
         if not args.force and summary_is_current(entry, session, taxonomy_updated):
             skipped.append(session["id"])
-            print(f"\n--- {session['id']}  unchanged; keep existing summary (--force to redo)")
+            if args.write and isinstance(entry, dict) and "summarizedTurnSeq" not in entry:
+                entry["summarizedTurnSeq"] = int(session.get("turnSeq") or 0)
+            say(f"\n--- {session['id']}  unchanged; keep existing summary (--force to redo)")
             continue
-        turns = compact_turns(session_turns(session, home, args.limit), 700, 1200)
-        refs = refs_by_session.get(session["id"], [])
-        pr_numbers = [ref["number"] for ref in refs]
-        pr_candidates = []
-        catalog_by_number = {
-            pr["number"]: pr for pr in catalog if isinstance(pr.get("number"), int)
-        }
-        for number in pr_numbers[:12]:
-            pr = catalog_by_number.get(number)
-            pr_candidates.append(
-                {
-                    "number": number,
-                    "title": pr.get("title", "") if pr else "",
-                    "state": pr.get("state", "UNKNOWN") if pr else "UNKNOWN",
-                }
-            )
-        prompt = session_prompt(session, entry, turns, pr_candidates, taxonomy)
-        print(
-            f"\n--- {session['id']}  {session.get('title', '')}  "
-            f"({len(turns)} turns, {len(pr_numbers)} PR links)"
+        rebuild = (
+            args.force
+            or not isinstance(entry, dict)
+            or entry.get("summarizedVersion") != SUMMARY_VERSION
         )
-        print(prompt[:700].replace("\n", " ") + ("..." if len(prompt) > 700 else ""))
+        bundle = collect_summary_input(session, home, entry, repo, catalog, full=rebuild)
+        # Keep the full evidence set before budget packing: snippets may be
+        # dropped to fit the prompt, but the PR numbers they prove are still
+        # authoritative for this summary.
+        evidence = list(bundle["prEvidence"])
+        evidence_numbers = [int(item["number"]) for item in evidence]
+        prompt, tokens = pack_summary_input(bundle, taxonomy, catalog)
+        mode_label = "full" if rebuild else "incremental"
+        say(
+            f"\n--- {session['id']}  {session.get('title', '')}  "
+            f"({bundle['turnCount']} turns, {len(bundle['userMessages'])} user msgs, "
+            f"{len(bundle['turnSummaries'])} turn summaries, "
+            f"{len(evidence_numbers)} PR evidence, ~{tokens} tokens, {mode_label})"
+        )
         if not args.write:
+            say(prompt[:900].replace("\n", " ") + ("..." if len(prompt) > 900 else ""))
             continue
         raw = call(
             prompt,
@@ -1162,10 +1676,12 @@ def main() -> None:
             thinking_budget=1024,
         )
         if raw is None:
+            failed.append(session["id"])
             continue
-        parsed = parse_session_output(raw, taxonomy, pr_numbers)
+        parsed = parse_session_output(raw, taxonomy, evidence_numbers)
         if parsed is None:
             print("  model returned no usable labels; keep existing values", file=sys.stderr)
+            failed.append(session["id"])
             continue
         if entry is None:
             entry = {
@@ -1184,19 +1700,39 @@ def main() -> None:
             entry["summary"] = parsed["summary"]
         if taxonomy is not None:
             entry["dimensions"] = parsed["dimensions"]
-        if parsed["pullRequests"] is not None:
-            entry["pullRequests"] = parsed["pullRequests"]
-        elif pr_numbers:
-            entry["pullRequests"] = pr_numbers[:4]
-        elif "pullRequests" not in entry:
-            entry["pullRequests"] = []
-        entry["summarizedSeq"] = session.get("seq")
+        chosen = [
+            number
+            for number in (parsed["pullRequests"] or [])
+            if number in evidence_numbers
+        ]
+        if not chosen:
+            chosen = evidence_numbers[:4]
+        if bundle["incremental"]:
+            previous_numbers: list[int] = []
+            for value in entry.get("pullRequests") or []:
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if number not in previous_numbers:
+                    previous_numbers.append(number)
+            chosen = list(dict.fromkeys([*previous_numbers, *chosen]))
+        chosen = chosen[:4]
+        entry["pullRequests"] = chosen
+        entry["summarizedSeq"] = int(bundle["contentSeq"])
+        entry["summarizedTurnSeq"] = int(bundle["turnSeq"])
+        # A summary taken while the turn is still running is provisional: the
+        # next run refreshes it from the finished turn (see summary_is_current).
+        entry["summarizedTurnOpen"] = bool(session.get("turnOpen"))
+        entry["summarizedVersion"] = SUMMARY_VERSION
         entry["summarizedTaxonomy"] = taxonomy_updated
+        ensure_catalog_entries(payload, chosen, repo, evidence)
+        catalog = payload.get("pullRequests") or []
         touched.append(session["id"])
-        print(f"  title: {entry.get('title', '')}")
-        print(f"  summary: {entry.get('summary', '')[:160]}")
-        print(f"  dimensions: {json.dumps(entry.get('dimensions', {}), ensure_ascii=False)}")
-        print(f"  prs: {entry.get('pullRequests', [])}")
+        say(f"  title: {entry.get('title', '')}")
+        say(f"  summary: {entry.get('summary', '')[:160]}")
+        say(f"  dimensions: {json.dumps(entry.get('dimensions', {}), ensure_ascii=False)}")
+        say(f"  prs: {entry.get('pullRequests', [])}")
 
     # Edges are inferred from titles/summaries, so an up-to-date project needs no
     # relation call; retry only when some entry has no dependsOn yet.
@@ -1205,7 +1741,7 @@ def main() -> None:
         for session in candidates
         if session["id"] in existing
     )
-    if args.write and args.relations and args.session is None and tag_sessions and needs_relations:
+    if args.write and args.relations and not USAGE["auth_failed"] and args.session is None and tag_sessions and needs_relations:
         relation_entries = []
         for session in candidates:
             entry = existing.get(session["id"])
@@ -1221,8 +1757,8 @@ def main() -> None:
             )
         if relation_entries:
             prompt = relation_prompt(relation_entries)
-            print("\n--- relations prompt ---")
-            print(prompt[:1000] + ("..." if len(prompt) > 1000 else ""))
+            say("\n--- relations prompt ---")
+            say(prompt[:1000] + ("..." if len(prompt) > 1000 else ""))
             raw = call(
                 prompt,
                 max_tokens=2000,
@@ -1239,12 +1775,9 @@ def main() -> None:
                     ],
                     edges,
                 )
-                print(f"relations: {len(edges)} model edges")
+                say(f"relations: {len(edges)} model edges")
 
-    if args.write:
-        link_session_pull_requests(payload, sessions, home, args.limit, repo)
-
-    print(
+    say(
         f"\nusage: calls={USAGE['calls']} input_tokens={USAGE['input']} "
         f"output_tokens={USAGE['output']} total_tokens={USAGE['input'] + USAGE['output']}"
     )
@@ -1252,11 +1785,29 @@ def main() -> None:
         payload["version"] = 3
         payload["title"] = payload.get("title") or project.name
         payload["updatedAt"] = now_iso()
-        graph_path.write_text(replace_graph_json(text, payload))
-        print(f"wrote {graph_path}")
-        print(f"sessions updated: {len(touched)}, skipped: {len(skipped)}")
+        if repo:
+            payload["repo"] = repo
+        write_graph_file(graph_path, text, payload)
+        say(f"wrote {graph_path}")
+        say(f"sessions updated: {len(touched)}, skipped: {len(skipped)}")
+        if failed:
+            # Keep any partial results on disk, but make the failure loud: the
+            # Host turns a non-zero exit into an error result, so the panel shows
+            # this instead of a silent "sessions updated: 0".
+            print(
+                f"\nsummary failed for {len(failed)} session(s): {', '.join(failed)}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        if (
+            not args.no_prs
+            and repo
+            and args.mode in ("sessions", "all", "taxonomy")
+            and pr_catalog_is_stale(payload)
+        ):
+            schedule_background_pr_refresh(project, graph_path, home, args.quiet)
     else:
-        print("dry-run: no API calls, no file writes; add --write to apply")
+        say("dry-run: no API calls, no file writes; add --write to apply")
 
 
 if __name__ == "__main__":
