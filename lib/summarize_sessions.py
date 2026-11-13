@@ -32,8 +32,13 @@ from a full rebuild.
 
 GitHub is a background concern: summarization never calls `gh`. The catalog is
 refreshed by `--mode prs` (also used by `/summarize-prs`), by a detached refresh
-spawned after a summary run, and by the Host's 90-second background timer; the
-latter two pass `--if-stale` so `prUpdatedAt` throttles repeated `gh` calls.
+spawned when a summary run starts, and by the Host's 90-second background timer;
+the latter two pass `--if-stale` so `prUpdatedAt` throttles repeated `gh` calls.
+
+Both writers rewrite the whole graph file, so `write_graph_file` re-reads it and
+merges by field ownership: a summary owns sessions/taxonomy, a refresh owns
+`pullRequests`/`prUpdatedAt`. Without that merge a slow summary would restore
+the catalog snapshot it read at startup and show merged PRs as open again.
 
 Archived sessions are frozen: they are skipped by default (even with --all and
 even when the graph file already lists them). Pass --include-archived to
@@ -585,18 +590,46 @@ def grep_pr_evidence(
     return items[:limit]
 
 
+def linked_pr_numbers(sessions: object) -> list[int]:
+    """Collect the PR numbers the graph's session entries link, in first-seen order."""
+    numbers: list[int] = []
+    for entry in sessions if isinstance(sessions, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        for value in entry.get("pullRequests") or []:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if number not in numbers:
+                numbers.append(number)
+    return numbers
+
+
 def ensure_catalog_entries(
     payload: dict,
     numbers: list[int],
     repo: str,
     evidence: list[dict],
+    previous: list[dict] | None = None,
 ) -> None:
-    """Make sure every linked PR can render, without calling GitHub."""
+    """Make sure every linked PR can render, without calling GitHub.
+
+    `gh pr list` only returns the newest `--limit` PRs, so a refresh can drop an
+    old PR that a session still links. Keep that PR's last known metadata
+    instead of downgrading it to an UNKNOWN placeholder: losing its merged state
+    and title is worse than showing a state that is one refresh out of date.
+    """
     catalog = payload.get("pullRequests")
     if not isinstance(catalog, list):
         catalog = []
     by_number = {
         pr.get("number"): pr for pr in catalog if isinstance(pr, dict)
+    }
+    remembered = {
+        pr.get("number"): pr
+        for pr in (previous or [])
+        if isinstance(pr, dict) and pr.get("number") is not None
     }
     urls = {
         int(item["number"]): item.get("url", "")
@@ -606,17 +639,21 @@ def ensure_catalog_entries(
     for number in numbers:
         if number in by_number:
             continue
-        pr = {
-            "number": number,
-            "title": "",
-            "url": urls.get(number)
-            or (f"https://github.com/{repo}/pull/{number}" if repo else ""),
-            "state": "UNKNOWN",
-            "author": "",
-            "headRefName": "",
-            "updatedAt": "",
-            "isDraft": False,
-        }
+        known = remembered.get(number)
+        if isinstance(known, dict):
+            pr = dict(known)
+        else:
+            pr = {
+                "number": number,
+                "title": "",
+                "url": urls.get(number)
+                or (f"https://github.com/{repo}/pull/{number}" if repo else ""),
+                "state": "UNKNOWN",
+                "author": "",
+                "headRefName": "",
+                "updatedAt": "",
+                "isDraft": False,
+            }
         catalog.append(pr)
         by_number[number] = pr
     catalog = [pr for pr in catalog if isinstance(pr, dict)]
@@ -1304,13 +1341,76 @@ def build_taxonomy_entries(
     return entries
 
 
-def write_graph_file(graph_path: Path, text: str, payload: dict) -> None:
-    """Atomic write so a background PR refresh never observes a half file."""
+GRAPH_PR_FIELDS = ("pullRequests", "prUpdatedAt")
+
+
+def write_graph_file(
+    graph_path: Path,
+    text: str,
+    payload: dict,
+    *,
+    owner: str = "sessions",
+    pr_updated: bool = False,
+) -> dict:
+    """Merge one run's fields into the freshest graph, then write it atomically.
+
+    A summary run and the detached PR refresh can overlap and both rewrite the
+    whole file. If each wrote the snapshot it read at startup, the slower writer
+    would silently restore stale data: a ten-minute summary used to put back the
+    PR catalog and `prUpdatedAt` it had read before the refresh landed, which
+    showed merged PRs as still open. The two runs therefore own disjoint field
+    groups — a summary owns sessions/taxonomy, the refresh owns the catalog —
+    and this writer re-reads the file so it only replaces what its caller owns.
+
+    `owner="prs"` keeps the on-disk sessions; `pr_updated` says whether `gh`
+    actually answered, so a failed refresh leaves the on-disk timestamp alone.
+    Returns the merged payload the file now holds.
+    """
     graph_path.parent.mkdir(parents=True, exist_ok=True)
-    body = replace_graph_json(text, payload)
+    current_text = text
+    current: dict | None = None
+    try:
+        if graph_path.exists():
+            current_text, loaded = graph_json(graph_path)
+            if isinstance(loaded, dict):
+                current = loaded
+    except (OSError, ValueError, TypeError):
+        # A truncated or hand-broken file must not make the run fail: fall back
+        # to the caller's snapshot, which is the previous good payload.
+        current = None
+
+    if owner == "prs":
+        merged = dict(current if current is not None else payload)
+        # The refresh may be the first run to detect the repository.
+        if not merged.get("repo") and payload.get("repo"):
+            merged["repo"] = payload["repo"]
+        if pr_updated:
+            merged["pullRequests"] = payload.get("pullRequests", [])
+            if "prUpdatedAt" in payload:
+                merged["prUpdatedAt"] = payload["prUpdatedAt"]
+    else:
+        merged = dict(payload)
+        if current is not None:
+            for key in GRAPH_PR_FIELDS:
+                if key in current:
+                    merged[key] = current[key]
+
+    # The refresh may have dropped a linked PR that fell outside `--limit`;
+    # re-attach its last known metadata (or a placeholder) from the old catalog.
+    previous = current.get("pullRequests") if current is not None else None
+    ensure_catalog_entries(
+        merged,
+        linked_pr_numbers(merged.get("sessions")),
+        str(merged.get("repo") or ""),
+        [],
+        previous=previous if isinstance(previous, list) else None,
+    )
+
+    body = replace_graph_json(current_text, merged)
     tmp = graph_path.with_name(f".{graph_path.name}.tmp")
     tmp.write_text(body)
     os.replace(tmp, graph_path)
+    return merged
 
 
 def write_progress(path: Path, **fields: object) -> None:
@@ -1491,27 +1591,29 @@ def main() -> None:
         elif repo and not args.quiet:
             print("PR catalog: gh unavailable; keeping existing entries", file=sys.stderr)
         payload["pullRequests"] = catalog
-        referenced: list[int] = []
-        for entry in payload.get("sessions") or []:
-            if not isinstance(entry, dict):
-                continue
-            for value in entry.get("pullRequests") or []:
-                try:
-                    number = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if number not in referenced:
-                    referenced.append(number)
-        ensure_catalog_entries(payload, referenced, repo, [])
         if repo:
             payload["repo"] = repo
         payload["version"] = 3
         payload["title"] = payload.get("title") or project.name
         if refreshed:
             payload["prUpdatedAt"] = now_iso()
-        write_graph_file(graph_path, text, payload)
-        say(f"wrote {graph_path} ({len(payload['pullRequests'])} PRs)")
+        written = write_graph_file(
+            graph_path, text, payload, owner="prs", pr_updated=refreshed
+        )
+        say(f"wrote {graph_path} ({len(written.get('pullRequests') or [])} PRs)")
         return
+
+    # Refresh PR state alongside the summary instead of after it. A summary can
+    # run for many minutes (or fail halfway), and both paths used to leave the
+    # catalog untouched. The refresh merges its own fields into the file, so it
+    # can land while the model calls are still in flight.
+    if (
+        args.write
+        and not args.no_prs
+        and repo
+        and pr_catalog_is_stale(payload)
+    ):
+        schedule_background_pr_refresh(project, graph_path, home, args.quiet)
 
     candidates = []
     for session in sessions.values():
@@ -1969,13 +2071,6 @@ def main() -> None:
                 file=sys.stderr,
             )
             raise SystemExit(1)
-        if (
-            not args.no_prs
-            and repo
-            and args.mode in ("sessions", "all", "taxonomy")
-            and pr_catalog_is_stale(payload)
-        ):
-            schedule_background_pr_refresh(project, graph_path, home, args.quiet)
     else:
         say("dry-run: no API calls, no file writes; add --write to apply")
 

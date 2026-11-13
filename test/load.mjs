@@ -343,6 +343,7 @@ const v3 = client.__test.parseSessionGraph(
         state: "OPEN"
       }
     ],
+    prUpdatedAt: "2026-01-01T00:00:00+00:00",
     sessions: [
       {
         session: "session-a",
@@ -361,6 +362,7 @@ assert.deepEqual(v3.entries[0].dimensions, { labeling: ["prompt"] });
 assert.deepEqual(v3.entries[0].pullRequests, [606]);
 assert.equal(v3.taxonomy.dimensions.length, 1);
 assert.equal(v3.pullRequests[0].state, "OPEN");
+assert.equal(v3.prUpdatedAt, "2026-01-01T00:00:00+00:00", "the PR refresh timestamp drives the staleness label");
 assert.equal(v3.repo, "example/repo");
 
 const titleChanges = client.__test.changedSessionTitles(
@@ -560,12 +562,15 @@ const prPanel = client.__test.PrPanel({
     pullRequests: [606]
   }],
   repo: v3.repo,
+  prUpdatedAt: v3.prUpdatedAt,
   tr: translate,
   onOpenSession: (sessionId) => opened.push(sessionId)
 });
 const prRows = findAll(prPanel, (node) => typeof node.props?.className === "string" &&
   node.props.className.split(" ").includes("dsm-pr-row"));
 assert.equal(prRows.length, 1, "default PR scope must only show PRs linked to a session");
+const prSub = findOne(prPanel, (node) => node.props?.className === "dsm-pr-sub");
+assert.ok(String(prSub.children?.[0] ?? prSub.props?.children ?? "").includes("PR 状态更新于"), "the PR view shows when GitHub state was last refreshed");
 const prTitle = findOne(prPanel, (node) => node.props?.className === "dsm-pr-title");
 assert.equal(prTitle.props.href, "https://github.com/example/repo/pull/606");
 const sessionChip = findOne(prPanel, (node) => node.props?.className === "dsm-session-chip");

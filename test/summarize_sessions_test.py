@@ -572,6 +572,104 @@ class MainPipelineTest(unittest.TestCase):
         self.assertEqual(calls, [("acme/demo", 300)])
         self.assertEqual(self.read_graph()["pullRequests"][0]["state"], "MERGED")
 
+    def test_pr_refresh_keeps_linked_prs_outside_the_limit(self) -> None:
+        payload = self.read_graph()
+        payload["prUpdatedAt"] = "2020-01-01T00:00:00+00:00"
+        payload["pullRequests"] = [
+            {"number": 500, "title": "old but merged", "state": "MERGED", "url": ""},
+            {"number": 646, "title": "ship it", "state": "OPEN", "url": ""},
+        ]
+        payload["sessions"] = [{"session": self.session_id, "pullRequests": [500, 646]}]
+        self.write_graph(payload)
+        original = summarizer.gh_pr_catalog
+        # A capped `gh pr list` no longer returns the older PR 500.
+        summarizer.gh_pr_catalog = lambda *_args, **_kwargs: [  # type: ignore[assignment]
+            {"number": 646, "title": "ship it", "state": "MERGED", "url": ""}
+        ]
+        try:
+            self.run_prs("--if-stale")
+        finally:
+            summarizer.gh_pr_catalog = original  # type: ignore[assignment]
+        catalog = {pr["number"]: pr for pr in self.read_graph()["pullRequests"]}
+        self.assertEqual(set(catalog), {500, 646}, "a linked PR must not disappear from the catalog")
+        self.assertEqual(catalog[500]["state"], "MERGED", "keep the last known state, not UNKNOWN")
+        self.assertEqual(catalog[500]["title"], "old but merged")
+        self.assertEqual(catalog[646]["state"], "MERGED")
+
+    def test_pr_refresh_write_keeps_sessions_added_meanwhile(self) -> None:
+        payload = self.read_graph()
+        payload["pullRequests"] = [{"number": 646, "title": "ship it", "state": "OPEN", "url": ""}]
+        payload["sessions"] = [{"session": "session-old", "title": "old"}]
+        self.write_graph(payload)
+        stale_text, stale = summarizer.graph_json(self.graph)
+
+        # A summary run lands between the refresh's read and its write.
+        fresh = dict(payload)
+        fresh["sessions"] = [{"session": "session-old", "title": "old"}, {"session": "session-new", "title": "new"}]
+        fresh["updatedAt"] = summarizer.now_iso()
+        self.write_graph(fresh)
+
+        stale["pullRequests"] = [{"number": 646, "title": "ship it", "state": "MERGED", "url": ""}]
+        stale["prUpdatedAt"] = summarizer.now_iso()
+        summarizer.write_graph_file(
+            self.graph, stale_text, stale, owner="prs", pr_updated=True
+        )
+
+        written = self.read_graph()
+        self.assertEqual([entry["session"] for entry in written["sessions"]], ["session-old", "session-new"])
+        self.assertEqual(written["pullRequests"][0]["state"], "MERGED")
+
+    def test_summary_write_keeps_a_newer_pr_catalog(self) -> None:
+        payload = self.read_graph()
+        payload["pullRequests"] = [{"number": 646, "title": "ship it", "state": "OPEN", "url": ""}]
+        payload["prUpdatedAt"] = "2020-01-01T00:00:00+00:00"
+        self.write_graph(payload)
+        stale_text, stale = summarizer.graph_json(self.graph)
+
+        # The detached refresh lands while the summary is still calling the model.
+        refreshed = dict(payload)
+        refreshed["pullRequests"] = [{"number": 646, "title": "ship it", "state": "MERGED", "url": ""}]
+        refreshed["prUpdatedAt"] = summarizer.now_iso()
+        self.write_graph(refreshed)
+
+        stale["sessions"] = [{"session": self.session_id, "pullRequests": [646]}]
+        summarizer.write_graph_file(self.graph, stale_text, stale)
+
+        written = self.read_graph()
+        self.assertEqual(written["pullRequests"][0]["state"], "MERGED", "the summary must not restore the stale catalog")
+        self.assertEqual(written["prUpdatedAt"], refreshed["prUpdatedAt"])
+        self.assertEqual(written["sessions"][0]["session"], self.session_id)
+
+    def test_failed_summary_still_schedules_pr_refresh(self) -> None:
+        payload = self.read_graph()
+        payload["prUpdatedAt"] = "2020-01-01T00:00:00+00:00"
+        self.write_graph(payload)
+        calls = []
+        original_schedule = summarizer.schedule_background_pr_refresh
+        summarizer.schedule_background_pr_refresh = lambda *args, **kwargs: calls.append(args)  # type: ignore[assignment]
+        self.addCleanup(setattr, summarizer, "schedule_background_pr_refresh", original_schedule)
+
+        def reject(*_args: object, **_kwargs: object) -> str:
+            raise RuntimeError("HTTP 500: model unavailable")
+
+        summarizer.call_llm = reject  # type: ignore[assignment]
+        original_argv = sys.argv
+        sys.argv = [
+            "summarize_sessions",
+            "--project", str(self.project),
+            "--graph", str(self.graph),
+            "--dsh-home", str(self.home),
+            "--mode", "sessions",
+            "--write",
+            "--quiet",
+        ]
+        try:
+            with self.assertRaises(SystemExit):
+                summarizer.main()
+        finally:
+            sys.argv = original_argv
+        self.assertEqual(len(calls), 1, "a failed summary must still start the PR refresh")
+
     def test_single_turn_summary_refreshes_after_the_turn_ends(self) -> None:
         # The session's only turn is still running when the user promotes it.
         self.open_turn = True
