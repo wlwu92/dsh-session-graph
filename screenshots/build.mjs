@@ -127,7 +127,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica
     <span class="dsm-source" title="${esc(data.source)}">${esc(data.source)}</span>
   </header>
   <div class="dsm-toolbar">
-    <select class="dsm-project-select"><option>${esc(data.project)}</option></select>
+    <span class="dsm-select-wrap">
+      <select class="dsm-project-select"><option>${esc(data.project)}</option></select>
+      <span class="dsm-select-caret" aria-hidden="true"></span>
+    </span>
     <input class="dsm-search" type="search" placeholder="${esc(data.search)}">
     <button class="dsm-btn primary" type="button">${esc(data.buttons.summaries)}</button>
     <span class="dsm-spacer"></span>
